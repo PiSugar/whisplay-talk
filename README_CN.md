@@ -120,6 +120,8 @@ cp .env.template .env
   默认 `24680`
 - `WHISPLAY_TALK_APP_HEARTBEAT_TIMEOUT_MS`
   默认 `500`，用于 peer 在线探测和延时测量的超时
+- `WHISPLAY_TALK_APP_HEARTBEAT_FAILS_BEFORE_OFFLINE`
+  默认 `3`，允许连续多少次心跳探测失败后才把 peer 标记为离线
 - `ALSA_INPUT_DEVICE`
   录音设备，默认 `default`
 - `ALSA_OUTPUT_DEVICE`

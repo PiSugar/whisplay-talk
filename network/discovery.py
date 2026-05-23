@@ -20,9 +20,17 @@ class Peer:
     latency_ms: int | None = None
 
 
+@dataclass
+class ProbeState:
+    online: bool = False
+    consecutive_failures: int = 0
+    latency_ms: int | None = None
+
+
 class TailscaleDiscovery:
     def __init__(self):
         self.peers: dict[str, Peer] = {}
+        self._probe_states: dict[str, ProbeState] = {}
         self.self_host = config.DEVICE_NAME
         self.status = "starting"
         self.error_message = ""
@@ -71,6 +79,7 @@ class TailscaleDiscovery:
         if backend_state in {"stopped"}:
             raise RuntimeError("Tailscale is installed but not running.")
         peers: dict[str, Peer] = {}
+        next_probe_states: dict[str, ProbeState] = {}
         self_info = payload.get("Self", {}) or {}
         self_dns_name = (self_info.get("DNSName") or "").rstrip(".")
         self.self_host = self_dns_name.split(".")[0] if self_dns_name else config.DEVICE_NAME
@@ -95,8 +104,10 @@ class TailscaleDiscovery:
             if item is self_info:
                 online = True
                 latency_ms = None
+                next_probe_states[host] = ProbeState(online=True)
             else:
-                online, latency_ms = self._probe_app_port(address)
+                online, latency_ms, probe_state = self._probe_app_port(host, address)
+                next_probe_states[host] = probe_state
             peers[host] = Peer(
                 name=name,
                 dns_name=dns_name,
@@ -104,9 +115,11 @@ class TailscaleDiscovery:
                 online=online,
                 latency_ms=latency_ms,
             )
+        self._probe_states = next_probe_states
         return peers
 
-    def _probe_app_port(self, address: str) -> tuple[bool, int | None]:
+    def _probe_app_port(self, host: str, address: str) -> tuple[bool, int | None, ProbeState]:
+        previous = self._probe_states.get(host, ProbeState())
         try:
             started_at = time.perf_counter()
             with socket.create_connection(
@@ -114,9 +127,19 @@ class TailscaleDiscovery:
                 timeout=max(0.05, config.APP_HEARTBEAT_TIMEOUT_MS / 1000.0),
             ):
                 latency_ms = max(1, int(round((time.perf_counter() - started_at) * 1000)))
-                return True, latency_ms
+                return True, latency_ms, ProbeState(
+                    online=True,
+                    consecutive_failures=0,
+                    latency_ms=latency_ms,
+                )
         except OSError:
-            return False, None
+            failures = previous.consecutive_failures + 1
+            keep_online = previous.online and failures < max(1, config.APP_HEARTBEAT_FAILS_BEFORE_OFFLINE)
+            return keep_online, previous.latency_ms if keep_online else None, ProbeState(
+                online=keep_online,
+                consecutive_failures=failures,
+                latency_ms=previous.latency_ms if keep_online else None,
+            )
 
     def online_peers(self) -> list[Peer]:
         peers = []

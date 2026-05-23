@@ -120,6 +120,8 @@ Important settings:
   Default: `24680`
 - `WHISPLAY_TALK_APP_HEARTBEAT_TIMEOUT_MS`
   Default `500`, timeout for peer online probing and latency measurement
+- `WHISPLAY_TALK_APP_HEARTBEAT_FAILS_BEFORE_OFFLINE`
+  Default `3`, number of consecutive failed heartbeat probes allowed before a peer is marked offline
 - `ALSA_INPUT_DEVICE`
   Recording device, default `default`
 - `ALSA_OUTPUT_DEVICE`
