@@ -52,6 +52,10 @@ class Application:
         self._incoming_queue: asyncio.Queue | None = None
         self._incoming_task: asyncio.Task | None = None
         self._last_ui_snapshot = None
+        self._shutdown_callback = None
+
+    def set_shutdown_callback(self, callback):
+        self._shutdown_callback = callback
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
@@ -220,13 +224,23 @@ class Application:
             self._loop.call_soon_threadsafe(self._stop_talking)
 
     def _on_exit_request(self):
-        if self._loop:
-            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.stop()))
+        self._request_shutdown()
 
     def _on_focus_revoked(self, payload):
         log.info("focus revoked: %s", payload)
-        if self._loop:
-            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.stop()))
+        self._request_shutdown()
+
+    def _request_shutdown(self):
+        if not self._loop:
+            return
+
+        def _schedule():
+            if self._shutdown_callback:
+                asyncio.create_task(self._shutdown_callback())
+            else:
+                asyncio.create_task(self.stop())
+
+        self._loop.call_soon_threadsafe(_schedule)
 
     def _start_talking(self):
         if self._talk_task and not self._talk_task.done():
@@ -480,6 +494,8 @@ async def run():
             return
         stop_event.set()
         await app.stop()
+
+    app.set_shutdown_callback(shutdown)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(shutdown()))
