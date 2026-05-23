@@ -153,16 +153,16 @@ cp .env.template .env
 
 UI 显示时会自动去掉 `whisplay-talk-` 前缀，所以 `whisplay-talk-kitchen` 会显示成 `kitchen`。
 
-建议所有设备都统一设置 hostname，例如：
+更推荐直接在 Tailscale 管理后台修改设备名，把每台设备改成 `whisplay-talk-<name>` 这种形式。
 
-```bash
-sudo hostnamectl set-hostname whisplay-talk-kitchen
-sudo hostnamectl set-hostname whisplay-talk-office
-```
+例如：
 
-修改 hostname 后，建议重启设备，或者重启 Tailscale，让新的 MagicDNS 名称尽快被其他 peer 看见。
+- `whisplay-talk-kitchen`
+- `whisplay-talk-room1`
 
-也可以通过 `WHISPLAY_TALK_DEVICE_NAME` 单独覆盖本机 app 名称，但更推荐直接使用系统 hostname 作为统一来源。
+在 Tailscale 后台改名后，等待新的 `MagicDNS` 名称同步到其他 peer 即可。
+
+如果确实需要，也可以通过 `WHISPLAY_TALK_DEVICE_NAME` 单独覆盖本机 app 名称。
 
 并确保这些设备都已经加入同一个 Tailscale tailnet。
 

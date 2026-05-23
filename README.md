@@ -153,16 +153,16 @@ Recommended naming pattern:
 
 The UI strips the `whisplay-talk-` prefix when showing device names, so `whisplay-talk-kitchen` is displayed as `kitchen`.
 
-It is recommended to give all devices consistent hostnames, for example:
+The recommended way to rename devices is directly in the Tailscale admin console, by editing each device name to match the `whisplay-talk-<name>` pattern.
 
-```bash
-sudo hostnamectl set-hostname whisplay-talk-kitchen
-sudo hostnamectl set-hostname whisplay-talk-office
-```
+For example:
 
-After changing the hostname, reboot the device or restart Tailscale so the updated MagicDNS name is visible to other peers.
+- `whisplay-talk-kitchen`
+- `whisplay-talk-room1`
 
-You can also override the local app name with `WHISPLAY_TALK_DEVICE_NAME`, but using the system hostname is the recommended setup.
+After renaming a device in Tailscale, wait for the updated `MagicDNS` name to propagate to peers.
+
+`WHISPLAY_TALK_DEVICE_NAME` can still be used as a local override when needed.
 
 Also make sure all devices have joined the same Tailscale tailnet.
 
