@@ -1,5 +1,7 @@
 # whisplay-talk
 
+<img src="https://docs.pisugar.com/img/whisplay_logo@4x-8.png" alt="Whisplay Talk" width="200" />
+
 [中文](README_CN.md)
 
 A P2P voice intercom app for Whisplay HAT, designed for real-time voice broadcasting between multiple Whisplay devices.

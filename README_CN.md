@@ -1,5 +1,7 @@
 # whisplay-talk
 
+<img src="https://docs.pisugar.com/img/whisplay_logo@4x-8.png" alt="Whisplay Talk" width="200" />
+
 [English](README.md)
 
 基于 Whisplay HAT 的 P2P 语音对讲应用，面向多台 Whisplay 设备之间的局域化语音广播场景。
