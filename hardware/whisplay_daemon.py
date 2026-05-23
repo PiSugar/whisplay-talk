@@ -67,6 +67,14 @@ class WhisplayDaemonProxy(NullBoard):
         self._launch_command = launch_command
         self._launch_cwd = launch_cwd
 
+    def _synthesize_button_release(self, reason: str):
+        if not self._button_down:
+            return
+        self._button_down = False
+        log.warning("synthesizing button release after %s", reason)
+        if self.button_release_callback:
+            self.button_release_callback()
+
     def _send_request(self, cmd: str, payload: dict | None = None) -> dict:
         body = {"version": 1, "cmd": cmd, "payload": payload or {}}
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
@@ -201,11 +209,13 @@ class WhisplayDaemonProxy(NullBoard):
                         elif name == "app_exit_requested" and self.exit_request_callback:
                             self.exit_request_callback()
                         elif name == "app_focus_revoked":
+                            self._synthesize_button_release("focus revoke")
                             self._session_token = None
                             self._detach_framebuffer()
                             if self.focus_revoked_callback:
                                 self.focus_revoked_callback(payload)
-            except Exception:
+            except Exception as exc:
+                self._synthesize_button_release(f"event stream error: {exc}")
                 time.sleep(0.5)
 
     def release_focus(self):
