@@ -6,7 +6,7 @@
 
 基于 Whisplay HAT 的 P2P 语音对讲应用，面向多台 Whisplay 设备之间的局域化语音广播场景。
 
-这个版本已经把核心链路搭起来了：
+核心功能：
 - 以 `whisplay-daemon` app 的形式接入和启动
 - 基于 Tailscale `MagicDNS` 发现在线设备，约定设备名以 `whisplay-talk-` 开头
 - 按住按钮讲话时，将麦克风音频压缩后通过 TCP 流实时发给所有在线 peer
@@ -36,7 +36,7 @@
 
 ## 当前实现
 
-当前仓库是一个可运行 MVP，技术方案如下：
+当前采用的技术方案如下：
 
 - 发现：
   通过 `tailscale status --json` 找到主机名以 `whisplay-talk-` 开头的设备，再额外探测每台设备的 app TCP 端口，只有探测成功才标记为在线，并记录心跳延时
@@ -81,6 +81,27 @@ bash install.sh
 - 下载字体 `NotoSansSC-Bold.ttf`
 - 在检测到 `whisplay-daemon` 时自动注册 app
 
+## Tailscale 安装
+
+所有设备都必须先加入同一个 Tailscale tailnet，`whisplay-talk` 才能发现彼此。
+
+在树莓派上安装 Tailscale：
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+执行 `sudo tailscale up` 后，终端会输出一个登录链接。用浏览器打开该链接并完成设备登录。
+
+可以通过下面的命令确认是否已经连上：
+
+```bash
+tailscale status
+```
+
+如果设备没有安装 Tailscale、还没登录，或者服务没有运行，app 会在屏幕上显示对应提示。
+
 ## 配置
 
 先复制配置文件：
@@ -120,12 +141,28 @@ cp .env.template .env
 - `WHISPLAY_TALK_RECEIVE_PREBUFFER_FRAMES`
   默认 `24`，按当前 40ms Opus 帧约等于先缓存 1 秒再播放
 
+## 设备命名
+
+设备发现依赖 Tailscale `MagicDNS` 主机名。只有主机名以 `whisplay-talk-` 开头的设备，才会被识别为对讲 peer。
+
+推荐命名方式：
+
+- `whisplay-talk-kitchen`
+- `whisplay-talk-room1`
+- `whisplay-talk-office`
+
+UI 显示时会自动去掉 `whisplay-talk-` 前缀，所以 `whisplay-talk-kitchen` 会显示成 `kitchen`。
+
 建议所有设备都统一设置 hostname，例如：
 
 ```bash
 sudo hostnamectl set-hostname whisplay-talk-kitchen
 sudo hostnamectl set-hostname whisplay-talk-office
 ```
+
+修改 hostname 后，建议重启设备，或者重启 Tailscale，让新的 MagicDNS 名称尽快被其他 peer 看见。
+
+也可以通过 `WHISPLAY_TALK_DEVICE_NAME` 单独覆盖本机 app 名称，但更推荐直接使用系统 hostname 作为统一来源。
 
 并确保这些设备都已经加入同一个 Tailscale tailnet。
 

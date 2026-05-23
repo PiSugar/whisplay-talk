@@ -6,7 +6,7 @@
 
 A P2P voice intercom app for Whisplay HAT, designed for real-time voice broadcasting between multiple Whisplay devices.
 
-This version already includes the core flow:
+Core flow:
 - Runs as a `whisplay-daemon` app
 - Discovers online devices through Tailscale `MagicDNS`, using the `whisplay-talk-` hostname prefix
 - While one device holds the talk button, microphone audio is compressed and streamed to all online peers over TCP
@@ -36,7 +36,7 @@ This version already includes the core flow:
 
 ## Current Implementation
 
-This repository is a runnable MVP with the following design:
+The project currently uses the following design:
 
 - Discovery:
   Polls `tailscale status --json` for devices whose hostname starts with `whisplay-talk-`, then probes the app TCP port on each device before marking it online and recording heartbeat latency
@@ -81,6 +81,27 @@ bash install.sh
 - Download the `NotoSansSC-Bold.ttf` font
 - Auto-register the app if `whisplay-daemon` is detected
 
+## Tailscale Setup
+
+Every device must join the same Tailscale tailnet before `whisplay-talk` can discover peers.
+
+Install Tailscale on Raspberry Pi:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+After `sudo tailscale up`, open the login URL shown in the terminal and complete the device login in your browser.
+
+You can verify the connection with:
+
+```bash
+tailscale status
+```
+
+If Tailscale is not installed, not logged in, or not running, the app will show a matching reminder on screen.
+
 ## Configuration
 
 First copy the config file:
@@ -120,12 +141,28 @@ Important settings:
 - `WHISPLAY_TALK_RECEIVE_PREBUFFER_FRAMES`
   Default `24`, roughly one second of audio at the current 40ms Opus frame size
 
+## Device Naming
+
+Peer discovery is based on Tailscale `MagicDNS` hostnames. Devices are only considered talk peers when their hostname starts with `whisplay-talk-`.
+
+Recommended naming pattern:
+
+- `whisplay-talk-kitchen`
+- `whisplay-talk-room1`
+- `whisplay-talk-office`
+
+The UI strips the `whisplay-talk-` prefix when showing device names, so `whisplay-talk-kitchen` is displayed as `kitchen`.
+
 It is recommended to give all devices consistent hostnames, for example:
 
 ```bash
 sudo hostnamectl set-hostname whisplay-talk-kitchen
 sudo hostnamectl set-hostname whisplay-talk-office
 ```
+
+After changing the hostname, reboot the device or restart Tailscale so the updated MagicDNS name is visible to other peers.
+
+You can also override the local app name with `WHISPLAY_TALK_DEVICE_NAME`, but using the system hostname is the recommended setup.
 
 Also make sure all devices have joined the same Tailscale tailnet.
 
