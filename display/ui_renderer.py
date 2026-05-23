@@ -16,6 +16,9 @@ _STATUS_ICON_HEIGHT = 15
 _NETWORK_ICON_CENTER_SCALE = 1.4
 _VPN_ICON_CENTER_SCALE = 1.4
 _VPN_ICON_NAME = "vpn.png"
+_TALK_ICON_NAME = "talk.png"
+_TALK_ICON_SCALE = 1.5
+_TALK_ICON_BASE_BOX = (46, 46)
 _APP_TITLE = "WhisplayTalk"
 
 
@@ -176,6 +179,7 @@ class UIRenderer(threading.Thread):
         self._wifi_source_icon_cache: dict[str, Image.Image | None] = {}
         self._wifi_scaled_icon_cache: dict[tuple[str, int, float], Image.Image | None] = {}
         self._vpn_icon_cache: dict[tuple[int, bool], Image.Image | None] = {}
+        self._talk_icon_cache: dict[tuple[int, int], Image.Image | None] = {}
 
     def update(self, **kwargs):
         self.state.update(**kwargs)
@@ -201,11 +205,19 @@ class UIRenderer(threading.Thread):
         draw = ImageDraw.Draw(img)
 
         accent = snap["accent"]
+        status_box_top = 42
+        status_box_bottom = 106
         draw.text((14, 10), _APP_TITLE, font=self._body_font, fill=(220, 230, 235))
-        draw.rounded_rectangle((8, 42, width - 8, 106), radius=16, fill=(18, 28, 32), outline=accent, width=2)
-        text_width = width - 48
+        draw.rounded_rectangle((8, status_box_top, width - 8, status_box_bottom), radius=16, fill=(18, 28, 32), outline=accent, width=2)
+        show_talk_icon = snap["status"] == "Receiving"
+        talk_box_w = int(round(_TALK_ICON_BASE_BOX[0] * _TALK_ICON_SCALE))
+        talk_box_h = min(int(round(_TALK_ICON_BASE_BOX[1] * _TALK_ICON_SCALE)), status_box_bottom - status_box_top - 8)
+        text_width = width - ((48 + talk_box_w) if show_talk_icon else 48)
         draw.text((20, 54), _fit_text(snap["status"], self._title_font, text_width), font=self._title_font, fill=(255, 255, 255))
         draw.text((20, 82), _fit_text(snap["device_name"], self._body_font, text_width), font=self._body_font, fill=(160, 220, 200))
+        if show_talk_icon:
+            talk_y = status_box_top + ((status_box_bottom - status_box_top - talk_box_h) // 2)
+            self._draw_talk_icon(img, width - 18 - talk_box_w, talk_y, talk_box_w, talk_box_h)
         self._draw_status_icons(img, draw, snap, width)
 
         draw.rounded_rectangle((8, 118, width - 8, 220), radius=16, fill=(15, 18, 20))
@@ -361,3 +373,30 @@ class UIRenderer(threading.Thread):
                     px[ix, iy] = (gray, gray, gray, a)
         self._vpn_icon_cache[cache_key] = icon
         return icon
+
+    def _draw_talk_icon(self, image: Image.Image, x: int, y: int, width: int, height: int):
+        icon = self._get_talk_icon(width, height)
+        if not icon:
+            return
+        paste_x = x + (width - icon.width) // 2
+        paste_y = y + (height - icon.height) // 2
+        image.paste(icon, (paste_x, paste_y), icon)
+
+    def _get_talk_icon(self, width: int, height: int) -> Image.Image | None:
+        cache_key = (width, height)
+        if cache_key in self._talk_icon_cache:
+            return self._talk_icon_cache[cache_key]
+
+        icon_path = os.path.join(_ASSETS_DIR, _TALK_ICON_NAME)
+        if not os.path.exists(icon_path):
+            self._talk_icon_cache[cache_key] = None
+            return None
+
+        src = Image.open(icon_path).convert("RGBA")
+        src_w, src_h = src.size
+        scale = min(width / src_w, height / src_h)
+        scaled_w = max(1, int(round(src_w * scale)))
+        scaled_h = max(1, int(round(src_h * scale)))
+        resized = src.resize((scaled_w, scaled_h), Image.LANCZOS)
+        self._talk_icon_cache[cache_key] = resized
+        return resized
