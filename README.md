@@ -9,22 +9,43 @@ A P2P voice intercom app for Whisplay HAT, designed for real-time voice broadcas
 This version already includes the core flow:
 - Runs as a `whisplay-daemon` app
 - Discovers online devices through Tailscale `MagicDNS`, using the `whisplay-talk-` hostname prefix
-- While one device holds the talk button, microphone audio is compressed and sent to all online peers over UDP
-- Other devices play the audio in real time and show who is currently speaking
-- While idle, the screen shows the list of online intercom devices
+- While one device holds the talk button, microphone audio is compressed and streamed to all online peers over TCP
+- Other devices play the audio in real time, highlight the active speaker, and show a receive icon in the status box
+- While idle, the screen shows the device list with online state and heartbeat latency
+
+## Screenshots
+
+<p align="center">
+  <img src="assets/readme/idle.png" alt="Idle screen" width="32%" />
+  <img src="assets/readme/speaking.png" alt="Speaking screen" width="32%" />
+  <img src="assets/readme/receiving.png" alt="Receiving screen" width="32%" />
+</p>
+
+## Interface Overview
+
+- Header:
+  Shows the `WhisplayTalk` title plus VPN, Wi-Fi signal, and battery status icons
+- Status card:
+  Shows the current app state, the local device name, and a talk icon on the right while receiving audio
+- Device list:
+  Keeps showing the peer list even while talking or receiving, with online / offline markers and heartbeat latency such as `kitchen (42ms)`
+- Active speaker highlight:
+  Highlights the device currently speaking in yellow
+- Footer:
+  Shows the current action hint such as `Hold button to talk`, `Release to stop`, or `Listening...`
 
 ## Current Implementation
 
 This repository is a runnable MVP with the following design:
 
 - Discovery:
-  Polls `tailscale status --json` for devices whose hostname starts with `whisplay-talk-`, then probes the app TCP port on each device before marking it online
+  Polls `tailscale status --json` for devices whose hostname starts with `whisplay-talk-`, then probes the app TCP port on each device before marking it online and recording heartbeat latency
 - Transport:
   All devices listen on fixed TCP port `24680` for audio streams
 - Audio:
   Uses `arecord` / `aplay`, with default 16kHz / 16-bit / mono capture, `Opus` voice encoding, a small receive jitter buffer, and one-frame redundant resend
 - Display:
-  Uses Pillow to render a 240x280 UI into the framebuffer provided by `whisplay-daemon`
+  Uses Pillow to render a 240x280 UI into the framebuffer provided by `whisplay-daemon`, including header VPN / Wi-Fi / battery icons and a live peer list
 - Input:
   Uses `whisplay-daemon` button events for push-to-talk
 
@@ -74,8 +95,10 @@ Important settings:
   Default: `whisplay-talk-`
 - `WHISPLAY_TALK_DEVICE_NAME`
   If empty, the system hostname is used. If it does not already have the prefix, the prefix is added automatically.
-- `WHISPLAY_TALK_UDP_PORT`
+- `WHISPLAY_TALK_TCP_PORT`
   Default: `24680`
+- `WHISPLAY_TALK_APP_HEARTBEAT_TIMEOUT_MS`
+  Default `500`, timeout for peer online probing and latency measurement
 - `ALSA_INPUT_DEVICE`
   Recording device, default `default`
 - `ALSA_OUTPUT_DEVICE`
@@ -125,21 +148,21 @@ bash startup.sh
 ## Interaction
 
 - While idle:
-  The screen shows the online device list
+  The screen shows the device list, including self, online / offline markers, and peer heartbeat latency
 - If Tailscale is not installed:
   The screen shows an install reminder
 - If Tailscale is installed but not logged in or not running:
   The screen shows the matching login/start hint
 - While holding the button:
-  The local device enters `Speaking`
+  The local device enters `Speaking` and stops local playback to avoid echo
 - After releasing the button:
   Sending stops and an end packet is broadcast
 - When remote audio is received:
-  The device enters `Receiving`, plays audio, and shows who is speaking
+  The device enters `Receiving`, plays audio, shows who is speaking, and displays the talk icon on the right side of the status box
 
-## UDP Packet Format
+## Stream Packet Format
 
-The current implementation uses a small custom header:
+The current implementation uses a small custom packet header over a TCP stream:
 
 - magic: `WT01`
 - type: `1`
@@ -153,7 +176,6 @@ The current implementation uses a small custom header:
 - optional redundant payload for the previous frame
 
 This makes it easy to evolve later toward:
-- Opus compression
 - Unicast priority
 - Push-to-talk arbitration
 - Half-duplex / full-duplex strategy
@@ -161,21 +183,12 @@ This makes it easy to evolve later toward:
 
 ## Known Limits
 
-This is still an MVP, so a few things are not implemented yet:
+This is still an MVP, so a few practical limitations remain:
 
-- It now defaults to `Opus`, but still uses a simple custom RTP-less transport instead of a full media stack
-- No arbitration yet; if two devices speak at once, the latest incoming stream wins
-- It currently prefers `whisplay-daemon` and does not yet provide a full direct-hardware fallback
-- No peer nickname management yet; names are derived from hostnames
-
-## Suggested Next Steps
-
-If we continue from here, the highest-value next improvements would be:
-
-1. Add Opus to reduce Tailscale bandwidth usage
-2. Add a simple channel lock to avoid two people grabbing the mic at the same time
-3. Refine the UI to look closer to `whisplay-ai-chatbot`
-4. Add more daemon-facing install artifacts such as a desktop entry or app manifest
+- The transport is still a custom TCP framing layer, not a standard voice/media protocol stack
+- There is no explicit channel lock or arbitration yet; overlapping talk attempts are not coordinated
+- Peer identity is still derived from the Tailscale hostname prefix, not from a separate nickname or contact system
+- The best experience still assumes `whisplay-daemon`; `startup.sh` only helps boot the app on systems without the daemon, it does not recreate the daemon UI/runtime model
 
 ## License
 

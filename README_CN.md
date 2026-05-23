@@ -9,22 +9,43 @@
 这个版本已经把核心链路搭起来了：
 - 以 `whisplay-daemon` app 的形式接入和启动
 - 基于 Tailscale `MagicDNS` 发现在线设备，约定设备名以 `whisplay-talk-` 开头
-- 按住按钮讲话时，将麦克风音频压缩后通过 UDP 单播到所有在线 peer
-- 其他设备实时播放，并在屏幕显示当前说话设备
-- 空闲时屏幕显示当前在线对讲设备列表
+- 按住按钮讲话时，将麦克风音频压缩后通过 TCP 流实时发给所有在线 peer
+- 其他设备实时播放，高亮当前说话设备，并在状态框显示接收图标
+- 空闲时屏幕显示设备列表、在线状态和心跳延时
+
+## 截图
+
+<p align="center">
+  <img src="assets/readme/idle.png" alt="Idle screen" width="32%" />
+  <img src="assets/readme/speaking.png" alt="Speaking screen" width="32%" />
+  <img src="assets/readme/receiving.png" alt="Receiving screen" width="32%" />
+</p>
+
+## 界面说明
+
+- Header：
+  显示 `WhisplayTalk` 标题，以及 VPN、Wi-Fi 信号、电池状态图标
+- 状态框：
+  显示当前 app 状态、本机设备名，以及接收音频时右侧的说话图标
+- 设备列表：
+  即使在讲话或接收时也持续显示 peer 列表，包含在线/离线标记和心跳延时，例如 `kitchen (42ms)`
+- 当前讲话高亮：
+  当前正在讲话的设备会以黄色高亮
+- 底部提示：
+  显示当前动作提示，例如 `Hold button to talk`、`Release to stop` 或 `Listening...`
 
 ## 当前实现
 
 当前仓库是一个可运行 MVP，技术方案如下：
 
 - 发现：
-  通过 `tailscale status --json` 找到主机名以 `whisplay-talk-` 开头的设备，再额外探测每台设备的 app TCP 端口，只有探测成功才标记为在线
+  通过 `tailscale status --json` 找到主机名以 `whisplay-talk-` 开头的设备，再额外探测每台设备的 app TCP 端口，只有探测成功才标记为在线，并记录心跳延时
 - 传输：
   所有设备监听固定 TCP 端口 `24680` 进行音频流传输
 - 音频：
   使用 `arecord` / `aplay` 录放音，默认 16kHz / 16-bit / mono 采集，配合 `Opus` 语音编码、接收端轻量抖动缓冲，以及单帧冗余重发
 - 显示：
-  使用 Pillow 渲染 240x280 UI，并写入 `whisplay-daemon` 提供的 framebuffer
+  使用 Pillow 渲染 240x280 UI，并写入 `whisplay-daemon` 提供的 framebuffer，包含 header 的 VPN / Wi-Fi / 电池图标和动态设备列表
 - 输入：
   通过 `whisplay-daemon` 的按钮事件实现按住说话
 
@@ -74,8 +95,10 @@ cp .env.template .env
   默认 `whisplay-talk-`
 - `WHISPLAY_TALK_DEVICE_NAME`
   留空时自动取系统 hostname；如果 hostname 没有此前缀，会自动补上
-- `WHISPLAY_TALK_UDP_PORT`
+- `WHISPLAY_TALK_TCP_PORT`
   默认 `24680`
+- `WHISPLAY_TALK_APP_HEARTBEAT_TIMEOUT_MS`
+  默认 `500`，用于 peer 在线探测和延时测量的超时
 - `ALSA_INPUT_DEVICE`
   录音设备，默认 `default`
 - `ALSA_OUTPUT_DEVICE`
@@ -127,21 +150,21 @@ bash startup.sh
 ## 交互说明
 
 - 空闲时：
-  屏幕显示在线设备列表
+  屏幕显示设备列表，包含自己、在线/离线标记，以及 peer 心跳延时
 - 如果设备没有安装 Tailscale：
   屏幕显示安装提醒
 - 如果设备安装了 Tailscale 但未登录或未运行：
   屏幕显示对应的登录/启动提示
 - 按住按钮：
-  本机进入 `Speaking`
+  本机进入 `Speaking`，并先停掉本地播放，避免回音
 - 松开按钮：
   停止发送，并发送一个结束包
 - 远端收到音频：
-  进入 `Receiving`，播放音频并显示谁在讲话
+  进入 `Receiving`，播放音频、显示谁在讲话，并在状态框右侧显示说话图标
 
-## UDP 包格式
+## 音频流包格式
 
-当前使用一个轻量自定义头：
+当前使用的是跑在 TCP 流上的轻量自定义包头：
 
 - magic: `WT01`
 - type: `1`
@@ -155,7 +178,6 @@ bash startup.sh
 - 可选的上一帧冗余 payload
 
 这让我们后续很容易继续演进到：
-- Opus 压缩
 - 单播优先级
 - 对讲占线控制
 - 半双工/全双工策略
@@ -163,21 +185,12 @@ bash startup.sh
 
 ## 已知边界
 
-当前版本是 MVP，还没有做这些能力：
+当前版本还是 MVP，当前比较明确的边界有这些：
 
-- 现在默认已经切到 `Opus`，但传输层仍然是轻量自定义协议，还不是完整媒体栈
-- 没有占线仲裁，两个设备同时讲话时会以“最后到达的流”为主
-- 目前优先走 `whisplay-daemon`，未内建完整 direct hardware fallback
-- 没有在线成员昵称管理，默认从 hostname 派生
-
-## 下一步建议
-
-如果我们继续往下做，最值得接着补的是：
-
-1. 引入 Opus，降低 Tailscale 上的带宽占用
-2. 增加一个简单的占线锁，避免多人同时抢麦
-3. 细化 UI，做成更接近 `whisplay-ai-chatbot` 的状态表现
-4. 增加 daemon 安装产物，例如 desktop entry / app manifest
+- 传输层仍然是自定义 TCP 音频分帧，不是标准语音/媒体协议栈
+- 还没有显式的占线锁或仲裁机制，多台设备同时抢麦时不会被协调管理
+- 设备身份目前仍然直接从 Tailscale hostname 前缀派生，没有单独的昵称或联系人体系
+- 最完整的体验仍然依赖 `whisplay-daemon`；`startup.sh` 只是帮助无 daemon 的系统开机启动 app，不等价于 daemon 那套 UI / runtime
 
 ## License
 
