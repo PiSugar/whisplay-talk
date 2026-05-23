@@ -6,6 +6,18 @@ from PIL import Image, ImageDraw, ImageFont
 
 import config
 
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets")
+_WIFI_LEVEL_ICONS = {
+    1: "wifi-weak.png",
+    2: "wifi-medium.png",
+    3: "wifi-strong.png",
+}
+_STATUS_ICON_HEIGHT = 15
+_NETWORK_ICON_CENTER_SCALE = 1.4
+_VPN_ICON_CENTER_SCALE = 1.4
+_VPN_ICON_NAME = "vpn.png"
+_APP_TITLE = "WhisplayTalk"
+
 
 def _find_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     candidates = [
@@ -31,11 +43,27 @@ def _find_small_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def _find_tiny_font() -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        config.FONT_PATH,
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "NotoSansSC-Bold.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return ImageFont.truetype(path, 12)
+    return ImageFont.load_default()
+
+
 def _measure_text(font: ImageFont.FreeTypeFont | ImageFont.ImageFont, text: str) -> int:
     if not text:
         return 0
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0]
+
+
+def _luminance(rgb: tuple[int, int, int]) -> float:
+    return 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]
 
 
 def _fit_text(text: str, font: ImageFont.FreeTypeFont | ImageFont.ImageFont, max_width: int) -> str:
@@ -105,6 +133,11 @@ class DisplayState:
         self.device_name = config.DEVICE_NAME
         self.main_text = ""
         self.footer_text = ""
+        self.battery_level = -1
+        self.battery_color = (128, 128, 128)
+        self.wifi_signal_level = 0
+        self.vpn_connected = False
+        self.active_peer = ""
 
     def update(self, **kwargs):
         with self.lock:
@@ -120,6 +153,11 @@ class DisplayState:
                 "device_name": self.device_name,
                 "main_text": self.main_text,
                 "footer_text": self.footer_text,
+                "battery_level": self.battery_level,
+                "battery_color": self.battery_color,
+                "wifi_signal_level": self.wifi_signal_level,
+                "vpn_connected": self.vpn_connected,
+                "active_peer": self.active_peer,
             }
 
 
@@ -133,6 +171,11 @@ class UIRenderer(threading.Thread):
         self._title_font = _find_font()
         self._body_font = _find_small_font()
         self._footer_font = _find_small_font()
+        self._battery_font = _find_small_font()
+        self._battery_font_tiny = _find_tiny_font()
+        self._wifi_source_icon_cache: dict[str, Image.Image | None] = {}
+        self._wifi_scaled_icon_cache: dict[tuple[str, int, float], Image.Image | None] = {}
+        self._vpn_icon_cache: dict[tuple[int, bool], Image.Image | None] = {}
 
     def update(self, **kwargs):
         self.state.update(**kwargs)
@@ -158,14 +201,22 @@ class UIRenderer(threading.Thread):
         draw = ImageDraw.Draw(img)
 
         accent = snap["accent"]
-        draw.rounded_rectangle((8, 8, width - 8, 72), radius=16, fill=(18, 28, 32), outline=accent, width=2)
-        draw.text((20, 20), _fit_text(snap["status"], self._title_font, width - 40), font=self._title_font, fill=(255, 255, 255))
-        draw.text((20, 48), _fit_text(snap["device_name"], self._body_font, width - 40), font=self._body_font, fill=(160, 220, 200))
+        draw.text((14, 10), _APP_TITLE, font=self._body_font, fill=(220, 230, 235))
+        draw.rounded_rectangle((8, 42, width - 8, 106), radius=16, fill=(18, 28, 32), outline=accent, width=2)
+        text_width = width - 48
+        draw.text((20, 54), _fit_text(snap["status"], self._title_font, text_width), font=self._title_font, fill=(255, 255, 255))
+        draw.text((20, 82), _fit_text(snap["device_name"], self._body_font, text_width), font=self._body_font, fill=(160, 220, 200))
+        self._draw_status_icons(img, draw, snap, width)
 
-        draw.rounded_rectangle((8, 84, width - 8, 220), radius=16, fill=(15, 18, 20))
-        y = 98
+        draw.rounded_rectangle((8, 118, width - 8, 220), radius=16, fill=(15, 18, 20))
+        y = 132
+        active_peer = (snap.get("active_peer") or "").strip().lower()
         for line in _wrap_text(snap["main_text"] or "Waiting...", self._body_font, width - 40, 6):
-            draw.text((18, y), line, font=self._body_font, fill=(230, 235, 240))
+            fill = (230, 235, 240)
+            normalized = line.lower()
+            if active_peer and active_peer in normalized:
+                fill = (255, 220, 90)
+            draw.text((18, y), line, font=self._body_font, fill=fill)
             y += 18
 
         draw.rounded_rectangle((8, 232, width - 8, height - 8), radius=14, fill=(18, 28, 32))
@@ -175,3 +226,138 @@ class UIRenderer(threading.Thread):
             draw.text((18, 242 + (index * 16)), line, font=self._footer_font, fill=(170, 200, 190))
 
         self.board.draw_image(0, 0, width, height, image_to_rgb565(img))
+
+    def _draw_status_icons(self, image: Image.Image, draw: ImageDraw.Draw, snap: dict, width: int):
+        cursor_x = width - 18
+        icon_gap = 8
+        y = 10
+
+        battery_w = self._measure_battery_icon(snap.get("battery_level", -1))
+        if battery_w > 0:
+            cursor_x -= battery_w
+            self._draw_battery(draw, snap, cursor_x, y)
+            cursor_x -= icon_gap
+
+        wifi_w = self._measure_wifi_icon(snap.get("wifi_signal_level", 0))
+        if wifi_w > 0:
+            cursor_x -= wifi_w
+            self._draw_wifi(image, snap.get("wifi_signal_level", 0), cursor_x, y - 1)
+            cursor_x -= icon_gap
+
+        vpn_w = self._measure_vpn_icon()
+        cursor_x -= vpn_w
+        self._draw_vpn(draw, snap.get("vpn_connected", False), cursor_x, y)
+
+    def _measure_battery_icon(self, level: int) -> int:
+        if level < 0:
+            return 0
+        return 28
+
+    def _draw_battery(self, draw: ImageDraw.Draw, snap: dict, x: int, y: int):
+        level = int(snap.get("battery_level", -1))
+        if level < 0:
+            return
+        color = snap.get("battery_color", (128, 128, 128))
+        font = self._battery_font_tiny if level >= 100 else self._battery_font
+        bw, bh = 26, 14
+        head_w, head_h = 2, 5
+        draw.rounded_rectangle((x, y, x + bw, y + bh), radius=3, outline="white", width=2)
+        draw.rectangle((x + 2, y + 2, x + bw - 2, y + bh - 2), fill=color)
+        draw.rectangle((x + bw, y + (bh - head_h) // 2, x + bw + head_w, y + (bh + head_h) // 2), fill="white")
+        if font:
+            text = str(level)
+            bbox = font.getbbox(text)
+            tw = bbox[2] - bbox[0]
+            fill = "black" if _luminance(color) > 128 else "white"
+            inner_left = x + 2
+            inner_right = x + bw - 2
+            text_x = x + max(3, (bw - tw) // 2)
+            if text_x < inner_left:
+                text_x = inner_left
+            if text_x + tw > inner_right:
+                text_x = inner_right - tw
+            ascent, descent = font.getmetrics()
+            text_y = y + max(0, (bh - (ascent + descent)) // 2 - 1)
+            draw.text((text_x, text_y), text, font=font, fill=fill)
+
+    def _measure_wifi_icon(self, level: int) -> int:
+        icon = self._get_wifi_icon(level)
+        if not icon:
+            return 0
+        return max(1, int(round(icon.width / _NETWORK_ICON_CENTER_SCALE)))
+
+    def _draw_wifi(self, image: Image.Image, level: int, x: int, y: int):
+        icon = self._get_wifi_icon(level)
+        if not icon:
+            return
+        base_w = self._measure_wifi_icon(level)
+        paste_x = x + (base_w - icon.width) // 2
+        paste_y = y + (_STATUS_ICON_HEIGHT - icon.height) // 2
+        image.paste(icon, (paste_x, paste_y), icon)
+
+    def _get_wifi_icon(self, level: int) -> Image.Image | None:
+        try:
+            lvl = int(level)
+        except (TypeError, ValueError):
+            return None
+        if lvl < 1 or lvl > 3:
+            return None
+        icon_name = _WIFI_LEVEL_ICONS[lvl]
+        cache_key = (icon_name, _STATUS_ICON_HEIGHT, _NETWORK_ICON_CENTER_SCALE)
+        if cache_key in self._wifi_scaled_icon_cache:
+            return self._wifi_scaled_icon_cache[cache_key]
+        if icon_name in self._wifi_source_icon_cache:
+            src = self._wifi_source_icon_cache[icon_name]
+        else:
+            icon_path = os.path.join(_ASSETS_DIR, icon_name)
+            src = Image.open(icon_path).convert("RGBA") if os.path.exists(icon_path) else None
+            self._wifi_source_icon_cache[icon_name] = src
+        if not src:
+            self._wifi_scaled_icon_cache[cache_key] = None
+            return None
+        src_w, src_h = src.size
+        scaled_h = max(1, int(round(_STATUS_ICON_HEIGHT * _NETWORK_ICON_CENTER_SCALE)))
+        scaled_w = max(1, int(round(src_w * scaled_h / src_h)))
+        resized = src.resize((scaled_w, scaled_h), Image.LANCZOS)
+        self._wifi_scaled_icon_cache[cache_key] = resized
+        return resized
+
+    def _measure_vpn_icon(self) -> int:
+        icon = self._get_vpn_icon(True)
+        if not icon:
+            return 0
+        return max(1, int(round(icon.width / _VPN_ICON_CENTER_SCALE)))
+
+    def _draw_vpn(self, draw: ImageDraw.Draw, connected: bool, x: int, y: int):
+        icon = self._get_vpn_icon(connected)
+        if not icon:
+            return
+        base_w = self._measure_vpn_icon()
+        paste_x = x + (base_w - icon.width) // 2
+        paste_y = y + (_STATUS_ICON_HEIGHT - icon.height) // 2
+        draw._image.paste(icon, (paste_x, paste_y), icon)
+
+    def _get_vpn_icon(self, connected: bool) -> Image.Image | None:
+        cache_key = (_STATUS_ICON_HEIGHT, round(_VPN_ICON_CENTER_SCALE, 4), connected)
+        if cache_key in self._vpn_icon_cache:
+            return self._vpn_icon_cache[cache_key]
+
+        icon_path = os.path.join(_ASSETS_DIR, _VPN_ICON_NAME)
+        if not os.path.exists(icon_path):
+            self._vpn_icon_cache[cache_key] = None
+            return None
+
+        src = Image.open(icon_path).convert("RGBA")
+        src_w, src_h = src.size
+        scaled_h = max(1, int(round(_STATUS_ICON_HEIGHT * _VPN_ICON_CENTER_SCALE)))
+        scaled_w = max(1, int(round(src_w * scaled_h / src_h)))
+        icon = src.resize((scaled_w, scaled_h), Image.LANCZOS)
+        if not connected:
+            px = icon.load()
+            for iy in range(icon.height):
+                for ix in range(icon.width):
+                    r, g, b, a = px[ix, iy]
+                    gray = int((r * 0.299) + (g * 0.587) + (b * 0.114))
+                    px[ix, iy] = (gray, gray, gray, a)
+        self._vpn_icon_cache[cache_key] = icon
+        return icon

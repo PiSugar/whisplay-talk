@@ -3,6 +3,7 @@ import json
 import logging
 import socket
 import subprocess
+import time
 from dataclasses import dataclass
 
 import config
@@ -16,6 +17,7 @@ class Peer:
     dns_name: str
     address: str
     online: bool
+    latency_ms: int | None = None
 
 
 class TailscaleDiscovery:
@@ -90,13 +92,31 @@ class TailscaleDiscovery:
             if not address:
                 continue
             name = host[len(config.DEVICE_PREFIX):] or host
+            if item is self_info:
+                online = True
+                latency_ms = None
+            else:
+                online, latency_ms = self._probe_app_port(address)
             peers[host] = Peer(
                 name=name,
                 dns_name=dns_name,
                 address=address,
-                online=bool(item.get("Online", False) or item is self_info),
+                online=online,
+                latency_ms=latency_ms,
             )
         return peers
+
+    def _probe_app_port(self, address: str) -> tuple[bool, int | None]:
+        try:
+            started_at = time.perf_counter()
+            with socket.create_connection(
+                (address, config.TCP_PORT),
+                timeout=max(0.05, config.APP_HEARTBEAT_TIMEOUT_MS / 1000.0),
+            ):
+                latency_ms = max(1, int(round((time.perf_counter() - started_at) * 1000)))
+                return True, latency_ms
+        except OSError:
+            return False, None
 
     def online_peers(self) -> list[Peer]:
         peers = []
@@ -119,6 +139,9 @@ class TailscaleDiscovery:
         if host.startswith(config.DEVICE_PREFIX):
             return host[len(config.DEVICE_PREFIX):] or host
         return host
+
+    def vpn_connected(self) -> bool:
+        return self.status == "ready"
 
     def display_status(self) -> tuple[str, str, str]:
         if self.status == "missing":

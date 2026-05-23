@@ -16,7 +16,7 @@
 当前仓库是一个可运行 MVP，技术方案如下：
 
 - 发现：
-  通过 `tailscale status --json` 轮询在线 peer，只采集主机名以 `whisplay-talk-` 开头的设备
+  通过 `tailscale status --json` 找到主机名以 `whisplay-talk-` 开头的设备，再额外探测每台设备的 app TCP 端口，只有探测成功才标记为在线
 - 传输：
   所有设备监听固定 TCP 端口 `24680` 进行音频流传输
 - 音频：
@@ -114,6 +114,14 @@ bash run.sh
 
 如果系统里运行了 `whisplay-daemon`，建议从 daemon 的 app 列表进入 `Talk`。
 
+如果设备不使用 `whisplay-daemon`，可以通过下面的脚本配置开机自启动：
+
+```bash
+bash startup.sh
+```
+
+`startup.sh` 会为当前应用安装一个 `systemd` 服务；如果检测到机器上已经有 `whisplay-daemon`，脚本会直接退出，不做额外配置。
+
 ## 交互说明
 
 - 空闲时：
@@ -168,3 +176,7 @@ bash run.sh
 2. 增加一个简单的占线锁，避免多人同时抢麦
 3. 细化 UI，做成更接近 `whisplay-ai-chatbot` 的状态表现
 4. 增加 daemon 安装产物，例如 desktop entry / app manifest
+
+## License
+
+本项目采用 GPL-3.0 许可证。详见 [LICENSE](LICENSE)。

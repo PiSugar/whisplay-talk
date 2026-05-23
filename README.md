@@ -16,7 +16,7 @@ This version already includes the core flow:
 This repository is a runnable MVP with the following design:
 
 - Discovery:
-  Polls `tailscale status --json` and only keeps devices whose hostname starts with `whisplay-talk-`
+  Polls `tailscale status --json` for devices whose hostname starts with `whisplay-talk-`, then probes the app TCP port on each device before marking it online
 - Transport:
   All devices listen on fixed TCP port `24680` for audio streams
 - Audio:
@@ -112,6 +112,14 @@ bash run.sh
 
 If `whisplay-daemon` is running on the system, it is recommended to launch `Talk` from the daemon app list.
 
+For systems that do not use `whisplay-daemon`, you can configure boot startup with:
+
+```bash
+bash startup.sh
+```
+
+`startup.sh` installs a `systemd` service for this app. If it detects `whisplay-daemon`, it exits without making changes.
+
 ## Interaction
 
 - While idle:
@@ -166,3 +174,7 @@ If we continue from here, the highest-value next improvements would be:
 2. Add a simple channel lock to avoid two people grabbing the mic at the same time
 3. Refine the UI to look closer to `whisplay-ai-chatbot`
 4. Add more daemon-facing install artifacts such as a desktop entry or app manifest
+
+## License
+
+This project is licensed under the GPL-3.0 license. See [LICENSE](LICENSE).

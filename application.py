@@ -8,6 +8,8 @@ from audio.codec import create_decoder, create_encoder
 from audio.audio_player import AudioPlayer
 from audio.audio_recorder import AudioRecorder
 from display.ui_renderer import UIRenderer
+from hardware.battery import BatteryMonitor
+from hardware.network import NetworkMonitor
 from hardware.whisplay_daemon import create_whisplay_hardware
 from network.discovery import TailscaleDiscovery
 from network.udp_audio import FLAG_END, FLAG_START, IncomingStreamTracker, UdpAudioTransport
@@ -25,6 +27,8 @@ class Application:
         self.board = None
         self.display = None
         self.discovery = TailscaleDiscovery()
+        self.battery = BatteryMonitor()
+        self.network = NetworkMonitor()
         self.recorder = AudioRecorder()
         self.player = AudioPlayer()
         self.transport = UdpAudioTransport(self._handle_packet)
@@ -65,6 +69,8 @@ class Application:
             self.board.on_focus_revoked(self._on_focus_revoked)
 
         await self.discovery.start()
+        await self.battery.start()
+        await self.network.start()
         await self.transport.start()
         self._incoming_queue = asyncio.Queue()
         self._incoming_task = asyncio.create_task(self._incoming_loop())
@@ -92,16 +98,18 @@ class Application:
             self._decoder = None
         await self.player.stop()
         await self.transport.stop()
+        await self.network.stop()
+        await self.battery.stop()
         await self.discovery.stop()
         if self.display:
             self.display.stop()
         if self.board:
             self.board.cleanup()
 
-    def _set_state(self, status: str, main_text: str, footer_text: str, accent=None):
+    def _set_state(self, status: str, main_text: str, footer_text: str, accent=None, active_peer: str = ""):
         accent = accent or self._accent_for_state(status)
         device_name = self.discovery.local_name()
-        snapshot = (status, device_name, main_text, footer_text, accent)
+        snapshot = (status, device_name, main_text, footer_text, accent, active_peer)
         self._state = status
         if snapshot == self._last_ui_snapshot:
             return
@@ -114,10 +122,18 @@ class Application:
             main_text=main_text,
             footer_text=footer_text,
             accent=accent,
+            battery_level=self.battery.level,
+            battery_color=self.battery.get_color(),
+            wifi_signal_level=self.network.signal_level,
+            vpn_connected=self.discovery.vpn_connected(),
+            active_peer=active_peer,
         )
         if self.board:
-            r, g, b = accent
-            self.board.set_rgb_fade(r, g, b, 120)
+            if status == self.IDLE:
+                self.board.set_rgb(0, 0, 0)
+            else:
+                r, g, b = accent
+                self.board.set_rgb_fade(r, g, b, 120)
 
     def _accent_for_state(self, status: str):
         if status == self.SPEAKING:
@@ -140,6 +156,13 @@ class Application:
                 self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
             elif self._state == self.IDLE:
                 self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
+            elif self.display:
+                self.display.update(
+                    battery_level=self.battery.level,
+                    battery_color=self.battery.get_color(),
+                    wifi_signal_level=self.network.signal_level,
+                    vpn_connected=self.discovery.vpn_connected(),
+                )
             await asyncio.sleep(1)
 
     def _reset_incoming_buffer(self):
@@ -175,6 +198,8 @@ class Application:
         for peer in peers[:6]:
             marker = "\u25cf" if peer.online else "\u25cb"
             label = peer.name
+            if peer.online and peer.latency_ms is not None:
+                label = f"{label} ({peer.latency_ms}ms)"
             if peer.name == self.discovery.local_name():
                 label = f"{label} (you)"
             lines.append(f"{marker} {label}")
@@ -219,6 +244,9 @@ class Application:
             self._set_state(self.ERROR, main_text, footer_text)
             await asyncio.sleep(1)
             return
+        await self.player.stop()
+        self.stream_tracker.clear()
+        self._reset_incoming_buffer()
         peers = self.discovery.online_peers()
         addresses = [peer.address for peer in peers]
         if not addresses:
@@ -230,7 +258,12 @@ class Application:
         self._stream_id = self.transport.new_stream_id()
         self._sequence = 0
         self._last_encoded_frame = b""
-        self._set_state(self.SPEAKING, f"Broadcasting to {len(addresses)} peer(s)", "Release to stop")
+        self._set_state(
+            self.SPEAKING,
+            self._peer_summary_text(),
+            "Release to stop",
+            active_peer=self.discovery.local_name(),
+        )
         try:
             self._encoder = create_encoder(
                 config.AUDIO_CODEC,
@@ -317,7 +350,12 @@ class Application:
             self._reset_incoming_buffer()
 
         self.stream_tracker.touch(packet)
-        self._set_state(self.RECEIVING, f"{packet.sender} is talking", "Listening...")
+        self._set_state(
+            self.RECEIVING,
+            self._peer_summary_text(),
+            "Listening...",
+            active_peer=packet.sender,
+        )
         if self._incoming_next_seq is None or packet.flags & FLAG_START:
             self._incoming_next_seq = packet.sequence
             self._incoming_started = False
