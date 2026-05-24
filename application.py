@@ -154,10 +154,13 @@ class Application:
             if discovery_status == self.ERROR:
                 self._set_state(self.ERROR, discovery_main_text, discovery_footer)
             elif self.stream_tracker.expired():
-                await self.player.stop()
-                self.stream_tracker.clear()
-                self._reset_incoming_buffer()
-                self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
+                if self._finish_buffered_playout_after_timeout():
+                    self.stream_tracker.clear()
+                else:
+                    await self.player.stop()
+                    self.stream_tracker.clear()
+                    self._reset_incoming_buffer()
+                    self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
             elif self._state == self.IDLE:
                 self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
             elif self.display:
@@ -190,6 +193,32 @@ class Application:
             count += 1
             seq += 1
         return count
+
+    def _highest_contiguous_buffered_seq(self) -> int | None:
+        if self._incoming_next_seq is None:
+            return None
+        count = self._contiguous_buffered_frames()
+        if count <= 0:
+            return None
+        return self._incoming_next_seq + count - 1
+
+    def _finish_buffered_playout_after_timeout(self) -> bool:
+        if self._incoming_end_seq is not None:
+            return False
+        buffered_end = self._highest_contiguous_buffered_seq()
+        if buffered_end is None:
+            return False
+        self._incoming_end_seq = buffered_end
+        if not self._incoming_started:
+            self._incoming_started = True
+            if not self._playout_task or self._playout_task.done():
+                self._playout_task = asyncio.create_task(self._playout_loop())
+        log.warning(
+            "stream timed out; draining buffered audio from seq=%s through seq=%s",
+            self._incoming_next_seq,
+            buffered_end,
+        )
+        return True
 
     def _peer_summary_text(self) -> str:
         if self.discovery.status != "ready":
