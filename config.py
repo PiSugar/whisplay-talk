@@ -17,6 +17,48 @@ def _int(key: str, default: str) -> int:
         return int(default)
 
 
+def _read_alsa_cards() -> list[str]:
+    try:
+        with open("/proc/asound/cards", "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return []
+
+    cards: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or not stripped[0].isdigit():
+            continue
+        parts = stripped.split("[", 1)
+        if len(parts) != 2:
+            continue
+        card_name = parts[1].split("]", 1)[0].strip()
+        if card_name:
+            cards.append(card_name)
+    return cards
+
+
+def _detect_whisplay_card() -> str | None:
+    preferred_cards = [
+        "whisplaySound",
+        "wm8960soundcard",
+        "ES8388Audio",
+        "ES8389Audio",
+    ]
+    available = set(_read_alsa_cards())
+    for card_name in preferred_cards:
+        if card_name in available:
+            return card_name
+    return None
+
+
+def _default_alsa_device() -> str:
+    card_name = _detect_whisplay_card()
+    if not card_name:
+        return "default"
+    return f"plughw:CARD={card_name},DEV=0"
+
+
 APP_ID = _get("WHISPLAY_TALK_APP_ID", "whisplay-talk")
 APP_NAME = _get("WHISPLAY_TALK_APP_NAME", "Talk")
 APP_ICON = _get("WHISPLAY_TALK_APP_ICON", "TT")
@@ -39,8 +81,8 @@ PLAYOUT_REBUFFER_LOW_FRAMES = _int("WHISPLAY_TALK_PLAYOUT_REBUFFER_LOW_FRAMES", 
 PLAYOUT_REBUFFER_RESUME_FRAMES = _int("WHISPLAY_TALK_PLAYOUT_REBUFFER_RESUME_FRAMES", "16")
 NETWORK_POLL_INTERVAL = _int("WHISPLAY_TALK_NETWORK_POLL_INTERVAL", "10")
 
-ALSA_INPUT_DEVICE = _get("ALSA_INPUT_DEVICE", "default")
-ALSA_OUTPUT_DEVICE = _get("ALSA_OUTPUT_DEVICE", "default")
+ALSA_INPUT_DEVICE = _get("ALSA_INPUT_DEVICE", _default_alsa_device())
+ALSA_OUTPUT_DEVICE = _get("ALSA_OUTPUT_DEVICE", _default_alsa_device())
 PLAYOUT_DUMP_PATH = _get("WHISPLAY_TALK_PLAYOUT_DUMP_PATH")
 AUDIO_SAMPLE_RATE = _int("AUDIO_SAMPLE_RATE", "16000")
 AUDIO_CHANNELS = 1
