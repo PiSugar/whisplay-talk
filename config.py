@@ -40,7 +40,7 @@ def _read_alsa_cards() -> list[str]:
 
 def _detect_whisplay_card() -> str | None:
     preferred_cards = [
-        "whisplaySound",
+        "whisplaysound",
         "wm8960soundcard",
         "ES8388Audio",
         "ES8389Audio",

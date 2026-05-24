@@ -123,9 +123,9 @@ Important settings:
 - `WHISPLAY_TALK_APP_HEARTBEAT_FAILS_BEFORE_OFFLINE`
   Default `5`, number of consecutive failed heartbeat probes allowed before a peer is marked offline
 - `ALSA_INPUT_DEVICE`
-  Recording device. If unset, the app auto-detects `whisplaySound`, `wm8960soundcard`, or compatible Whisplay cards before falling back to `default`
+  Recording device. If unset, the app auto-detects `whisplaysound`, `wm8960soundcard`, or compatible Whisplay cards before falling back to `default`
 - `ALSA_OUTPUT_DEVICE`
-  Playback device. If unset, the app auto-detects `whisplaySound`, `wm8960soundcard`, or compatible Whisplay cards before falling back to `default`
+  Playback device. If unset, the app auto-detects `whisplaysound`, `wm8960soundcard`, or compatible Whisplay cards before falling back to `default`
 - `AUDIO_CODEC`
   Default `opus`, recommended for current real-time talkback
 - `AUDIO_FRAME_MS`
