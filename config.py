@@ -56,6 +56,8 @@ def _default_alsa_device() -> str:
     card_name = _detect_whisplay_card()
     if not card_name:
         return "default"
+    if card_name == "whisplaysound":
+        return f"default:CARD={card_name}"
     return f"plughw:CARD={card_name},DEV=0"
 
 
