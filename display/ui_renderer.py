@@ -288,8 +288,8 @@ class UIRenderer(threading.Thread):
                 text_x = inner_left
             if text_x + tw > inner_right:
                 text_x = inner_right - tw
-            ascent, descent = font.getmetrics()
-            text_y = y + max(0, (bh - (ascent + descent)) // 2 - 1)
+            th = bbox[3] - bbox[1]
+            text_y = y + ((bh - th) // 2) - bbox[1]
             draw.text((text_x, text_y), text, font=font, fill=fill)
 
     def _measure_wifi_icon(self, level: int) -> int:
