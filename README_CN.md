@@ -123,9 +123,9 @@ cp .env.template .env
 - `WHISPLAY_TALK_APP_HEARTBEAT_FAILS_BEFORE_OFFLINE`
   默认 `5`，允许连续多少次心跳探测失败后才把 peer 标记为离线
 - `ALSA_INPUT_DEVICE`
-  录音设备。留空时会优先自动识别 `whisplaysound`、`wm8960soundcard` 等 Whisplay 声卡，找不到再回退到 `default`
+  录音设备。留空时会优先自动识别 `whisplaysound`，并兼容旧 Whisplay 卡名，找不到再回退到 `default`
 - `ALSA_OUTPUT_DEVICE`
-  播放设备。留空时会优先自动识别 `whisplaysound`、`wm8960soundcard` 等 Whisplay 声卡，找不到再回退到 `default`
+  播放设备。留空时会优先自动识别 `whisplaysound`，并兼容旧 Whisplay 卡名，找不到再回退到 `default`
 - `AUDIO_CODEC`
   默认 `opus`，是当前这版实时对讲推荐配置
 - `AUDIO_FRAME_MS`
