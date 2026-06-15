@@ -57,8 +57,8 @@ def _default_alsa_device() -> str:
     if not card_name:
         return "default"
     if card_name == "whisplaysound":
-        return f"default:CARD={card_name}"
-    return f"plughw:CARD={card_name},DEV=0"
+        return card_name
+    return f"plughw:CARD={card_name}"
 
 
 APP_ID = _get("WHISPLAY_TALK_APP_ID", "whisplay-talk")
