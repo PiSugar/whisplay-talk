@@ -96,49 +96,58 @@ class AudioPlayer:
 
     async def _writer(self):
         loop = asyncio.get_running_loop()
-        if self._use_alsa and self._pcm:
-            if self._dump:
-                self._dump.write(self._silence * self._prefill_frames)
-            await loop.run_in_executor(None, self._pcm.write, self._silence * self._prefill_frames)
-        elif self._process and self._process.stdin:
-            if self._dump:
-                self._dump.write(self._silence * self._prefill_frames)
-            await loop.run_in_executor(None, self._process.stdin.write, self._silence * self._prefill_frames)
-        while True:
-            chunk = await self._queue.get()
-            if chunk is None:
-                break
-            if self._use_alsa and not self._pcm:
-                break
-            if not self._use_alsa and (not self._process or not self._process.stdin):
-                break
-            try:
-                chunks = [chunk]
-                while True:
-                    try:
-                        queued = self._queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    if queued is None:
-                        await self._queue.put(None)
-                        break
-                    chunks.append(queued)
-                payload = b"".join(chunks)
+        try:
+            if self._use_alsa and self._pcm:
                 if self._dump:
-                    self._dump.write(payload)
+                    self._dump.write(self._silence * self._prefill_frames)
+                await loop.run_in_executor(None, self._pcm.write, self._silence * self._prefill_frames)
+            elif self._process and self._process.stdin:
+                if self._dump:
+                    self._dump.write(self._silence * self._prefill_frames)
+                await loop.run_in_executor(None, self._process.stdin.write, self._silence * self._prefill_frames)
+            while True:
+                chunk = await self._queue.get()
+                if chunk is None:
+                    break
                 if self._use_alsa and self._pcm:
-                    await loop.run_in_executor(None, self._pcm.write, payload)
+                    pass
+                elif not self._use_alsa and self._process and self._process.stdin:
+                    pass
                 else:
-                    await loop.run_in_executor(None, self._process.stdin.write, payload)
-            except Exception as exc:
-                code = self._process.poll() if self._process else None
-                log.warning(
-                    "player writer stopped: type=%s repr=%r code=%s",
-                    type(exc).__name__,
-                    exc,
-                    code,
-                )
-                break
+                    break
+                try:
+                    chunks = [chunk]
+                    while True:
+                        try:
+                            queued = self._queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        if queued is None:
+                            await self._queue.put(None)
+                            break
+                        chunks.append(queued)
+                    payload = b"".join(chunks)
+                    if self._dump:
+                        self._dump.write(payload)
+                    if self._use_alsa and self._pcm:
+                        await loop.run_in_executor(None, self._pcm.write, payload)
+                    else:
+                        await loop.run_in_executor(None, self._process.stdin.write, payload)
+                except Exception as exc:
+                    code = self._process.poll() if self._process else None
+                    log.warning(
+                        "player writer stopped: type=%s repr=%r code=%s",
+                        type(exc).__name__,
+                        exc,
+                        code,
+                    )
+                    break
+        finally:
+            if not self._use_alsa and self._process and self._process.stdin:
+                try:
+                    await loop.run_in_executor(None, self._process.stdin.close)
+                except Exception:
+                    pass
 
     async def put(self, data: bytes):
         await self._ensure_started()
@@ -161,12 +170,13 @@ class AudioPlayer:
                 self._pcm = None
             if self._process:
                 try:
-                    if self._process.stdin:
-                        self._process.stdin.close()
-                    self._process.terminate()
-                    self._process.wait(timeout=2)
+                    self._process.wait(timeout=4)
                 except Exception:
-                    self._process.kill()
+                    try:
+                        self._process.terminate()
+                        self._process.wait(timeout=1)
+                    except Exception:
+                        self._process.kill()
                 self._process = None
             if self._dump:
                 try:

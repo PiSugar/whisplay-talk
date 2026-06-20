@@ -38,6 +38,7 @@ class Application:
         self._loop = None
         self._talk_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
+        self._talk_stop_requested = False
         self._sequence = 0
         self._stream_id: bytes | None = None
         self._talk_started_at = 0.0
@@ -274,11 +275,13 @@ class Application:
     def _start_talking(self):
         if self._talk_task and not self._talk_task.done():
             return
+        self._talk_stop_requested = False
         self._talk_started_at = time.time()
         self._talk_task = asyncio.create_task(self._talk_loop())
 
     def _stop_talking(self):
         log.info("stop talking requested after %.3fs", time.time() - self._talk_started_at if self._talk_started_at else -1)
+        self._talk_stop_requested = True
         self.recorder.stop()
 
     async def _talk_loop(self):
@@ -301,6 +304,11 @@ class Application:
         self._stream_id = self.transport.new_stream_id()
         self._sequence = 0
         self._last_encoded_frame = b""
+        log.info(
+            "talk stream start id=%s peers=%s",
+            self._stream_id.hex(),
+            ",".join(addresses),
+        )
         self._set_state(
             self.SPEAKING,
             self._peer_summary_text(),
@@ -319,6 +327,8 @@ class Application:
                 config.AUDIO_OPUS_PACKET_LOSS_PERC,
                 bool(config.AUDIO_OPUS_ENABLE_FEC),
             )
+            if self._talk_stop_requested:
+                return
             self.recorder.start()
             first = True
             async for frame in self.recorder.read_frames():
@@ -347,7 +357,8 @@ class Application:
             self._set_state(self.ERROR, "Audio capture failed", str(exc))
             await asyncio.sleep(1)
         finally:
-            if self._stream_id:
+            if self._stream_id and self._sequence > 0:
+                log.info("talk stream end id=%s frames=%s", self._stream_id.hex(), self._sequence)
                 await self.transport.send_frame(
                     self.discovery.local_name(),
                     addresses,
@@ -388,6 +399,14 @@ class Application:
         if self._stream_id is not None:
             return
         if self.stream_tracker.current_stream_id and packet.stream_id != self.stream_tracker.current_stream_id:
+            log.info(
+                "incoming stream switch old=%s new=%s sender=%s seq=%s flags=%s",
+                self.stream_tracker.current_stream_id.hex(),
+                packet.stream_id.hex(),
+                packet.sender,
+                packet.sequence,
+                packet.flags,
+            )
             await self.player.stop()
             self.stream_tracker.clear()
             self._reset_incoming_buffer()
@@ -400,6 +419,15 @@ class Application:
             active_peer=packet.sender,
         )
         if self._incoming_next_seq is None or packet.flags & FLAG_START:
+            log.info(
+                "incoming stream start id=%s sender=%s seq=%s flags=%s codec=%s payload=%s",
+                packet.stream_id.hex(),
+                packet.sender,
+                packet.sequence,
+                packet.flags,
+                packet.codec,
+                len(packet.payload),
+            )
             self._incoming_next_seq = packet.sequence
             self._incoming_started = False
             self._incoming_packets.clear()
@@ -451,6 +479,15 @@ class Application:
                 self._incoming_next_seq = min_seq
 
         if packet.flags & FLAG_END:
+            log.info(
+                "incoming stream end id=%s sender=%s seq=%s buffered=%s next=%s started=%s",
+                packet.stream_id.hex(),
+                packet.sender,
+                packet.sequence,
+                len(self._incoming_packets),
+                self._incoming_next_seq,
+                self._incoming_started,
+            )
             self._incoming_end_seq = packet.sequence
 
     async def _playout_loop(self):
@@ -460,6 +497,10 @@ class Application:
         rebuffer_resume = max(rebuffer_low, config.PLAYOUT_REBUFFER_RESUME_FRAMES)
         loop = asyncio.get_running_loop()
         next_deadline = loop.time()
+        stream_id = self.stream_tracker.current_stream_id.hex() if self.stream_tracker.current_stream_id else ""
+        started_seq = self._incoming_next_seq
+        decoded_frames = 0
+        concealed_frames = 0
         try:
             while self._running and self._incoming_started and self._incoming_next_seq is not None:
                 if (
@@ -488,9 +529,11 @@ class Application:
                 pcm = None
                 if payload is not None:
                     pcm = self._decoder.decode(payload) if self._decoder else payload
+                    decoded_frames += 1
                 elif self._decoder and hasattr(self._decoder, "conceal"):
                     try:
                         pcm = self._decoder.conceal()
+                        concealed_frames += 1
                     except Exception as exc:
                         log.warning("decoder conceal failed at seq=%s: %s", self._incoming_next_seq, exc)
                         pcm = b""
@@ -504,6 +547,17 @@ class Application:
         except asyncio.CancelledError:
             raise
         finally:
+            log.info(
+                "playout ended id=%s start_seq=%s next_seq=%s end_seq=%s decoded=%s concealed=%s buffered=%s running=%s",
+                stream_id,
+                started_seq,
+                self._incoming_next_seq,
+                self._incoming_end_seq,
+                decoded_frames,
+                concealed_frames,
+                len(self._incoming_packets),
+                self._running,
+            )
             if self._playout_task is asyncio.current_task():
                 self._playout_task = None
             await self.player.stop()
