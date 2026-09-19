@@ -11,8 +11,8 @@ from display.ui_renderer import UIRenderer
 from hardware.battery import BatteryMonitor
 from hardware.network import NetworkMonitor
 from hardware.whisplay_daemon import create_whisplay_hardware
-from network.discovery import TailscaleDiscovery
-from network.udp_audio import FLAG_END, FLAG_START, IncomingStreamTracker, UdpAudioTransport
+from network.hybrid import HybridAudioTransport, HybridDiscovery
+from network.udp_audio import FLAG_END, FLAG_START, IncomingStreamTracker
 
 log = logging.getLogger("app")
 
@@ -26,12 +26,12 @@ class Application:
     def __init__(self):
         self.board = None
         self.display = None
-        self.discovery = TailscaleDiscovery()
+        self.transport = HybridAudioTransport(self._handle_packet)
+        self.discovery = HybridDiscovery(self.transport)
         self.battery = BatteryMonitor()
         self.network = NetworkMonitor()
         self.recorder = AudioRecorder()
         self.player = AudioPlayer()
-        self.transport = UdpAudioTransport(self._handle_packet)
         self.stream_tracker = IncomingStreamTracker()
         self._state = self.IDLE
         self._running = False
@@ -46,6 +46,7 @@ class Application:
         self._incoming_next_seq: int | None = None
         self._incoming_started = False
         self._incoming_end_seq: int | None = None
+        self._incoming_transport = "TCP"
         self._last_encoded_frame = b""
         self._encoder = None
         self._decoder = None
@@ -73,10 +74,10 @@ class Application:
         if hasattr(self.board, "on_focus_revoked"):
             self.board.on_focus_revoked(self._on_focus_revoked)
 
+        await self.transport.start()
         await self.discovery.start()
         await self.battery.start()
         await self.network.start()
-        await self.transport.start()
         self._incoming_queue = asyncio.Queue()
         self._incoming_task = asyncio.create_task(self._incoming_loop())
         self._monitor_task = asyncio.create_task(self._display_loop())
@@ -86,15 +87,31 @@ class Application:
         if not self._running:
             return
         self._running = False
-        if self._talk_task:
-            self._talk_task.cancel()
-        if self._monitor_task:
-            self._monitor_task.cancel()
-        if self._playout_task:
-            self._playout_task.cancel()
-        if self._incoming_task:
-            self._incoming_task.cancel()
+        background_tasks = [
+            task
+            for task in (
+                self._talk_task,
+                self._monitor_task,
+                self._playout_task,
+                self._incoming_task,
+            )
+            if task and task is not asyncio.current_task()
+        ]
+        for task in background_tasks:
+            task.cancel()
         self.recorder.stop()
+        if background_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*background_tasks, return_exceptions=True),
+                    timeout=3,
+                )
+            except asyncio.TimeoutError:
+                log.warning("timed out waiting for background tasks during shutdown")
+        self._talk_task = None
+        self._monitor_task = None
+        self._playout_task = None
+        self._incoming_task = None
         if self._encoder:
             self._encoder.close()
             self._encoder = None
@@ -102,10 +119,10 @@ class Application:
             self._decoder.close()
             self._decoder = None
         await self.player.stop()
+        await self.discovery.stop()
         await self.transport.stop()
         await self.network.stop()
         await self.battery.stop()
-        await self.discovery.stop()
         if self.display:
             self.display.stop()
         if self.board:
@@ -114,7 +131,8 @@ class Application:
     def _set_state(self, status: str, main_text: str, footer_text: str, accent=None, active_peer: str = ""):
         accent = accent or self._accent_for_state(status)
         device_name = self.discovery.local_name()
-        snapshot = (status, device_name, main_text, footer_text, accent, active_peer)
+        esp_channel = self.discovery.espnow_channel()
+        snapshot = (status, device_name, main_text, footer_text, accent, active_peer, esp_channel)
         self._state = status
         if snapshot == self._last_ui_snapshot:
             return
@@ -131,6 +149,7 @@ class Application:
             battery_color=self.battery.get_color(),
             wifi_signal_level=self.network.signal_level,
             vpn_connected=self.discovery.vpn_connected(),
+            esp_channel=esp_channel,
             active_peer=active_peer,
         )
         if self.board:
@@ -170,6 +189,7 @@ class Application:
                     battery_color=self.battery.get_color(),
                     wifi_signal_level=self.network.signal_level,
                     vpn_connected=self.discovery.vpn_connected(),
+                    esp_channel=self.discovery.espnow_channel(),
                 )
             await asyncio.sleep(1)
 
@@ -178,6 +198,7 @@ class Application:
         self._incoming_next_seq = None
         self._incoming_started = False
         self._incoming_end_seq = None
+        self._incoming_transport = "TCP"
         if self._playout_task:
             self._playout_task.cancel()
             self._playout_task = None
@@ -226,16 +247,14 @@ class Application:
             return self.discovery.display_status()[1]
         peers = self.discovery.all_peers()
         if not peers:
-            return f"\u25cf {self.discovery.local_name()}"
+            return f"\u25cf {self.discovery.local_name()} [TCP]"
 
         lines: list[str] = []
         for peer in peers[:6]:
             marker = "\u25cf" if peer.online else "\u25cb"
-            label = peer.name
+            label = f"{peer.name} [{peer.transport}]"
             if peer.online and peer.latency_ms is not None:
                 label = f"{label} ({peer.latency_ms}ms)"
-            if peer.name == self.discovery.local_name():
-                label = f"{label} (you)"
             lines.append(f"{marker} {label}")
 
         extra = len(peers) - 6
@@ -296,7 +315,7 @@ class Application:
         peers = self.discovery.online_peers()
         addresses = [peer.address for peer in peers]
         if not addresses:
-            self._set_state(self.ERROR, "No online peers", "Check Tailscale peers")
+            self._set_state(self.ERROR, "No online peers", "Waiting for ESP/TCP peers")
             await asyncio.sleep(1)
             self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
             return
@@ -376,29 +395,30 @@ class Application:
             log.info("talk loop ended after %.3fs", time.time() - self._talk_started_at if self._talk_started_at else -1)
             self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
 
-    def _handle_packet(self, packet, addr):
+    def _handle_packet(self, packet, addr, transport):
         if packet.sender == self.discovery.local_name():
             return
         if self._incoming_queue is not None:
-            self._incoming_queue.put_nowait(packet)
+            self._incoming_queue.put_nowait((packet, transport))
 
     async def _incoming_loop(self):
         while self._running:
             try:
-                packet = await self._incoming_queue.get()
+                packet, transport = await self._incoming_queue.get()
             except asyncio.CancelledError:
                 raise
             try:
-                await self._handle_incoming_packet(packet)
+                await self._handle_incoming_packet(packet, transport)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("incoming packet handler failed")
 
-    async def _handle_incoming_packet(self, packet):
+    async def _handle_incoming_packet(self, packet, transport):
         if self._stream_id is not None:
             return
-        if self.stream_tracker.current_stream_id and packet.stream_id != self.stream_tracker.current_stream_id:
+        is_new_stream = self.stream_tracker.current_stream_id != packet.stream_id
+        if self.stream_tracker.current_stream_id and is_new_stream:
             log.info(
                 "incoming stream switch old=%s new=%s sender=%s seq=%s flags=%s",
                 self.stream_tracker.current_stream_id.hex(),
@@ -418,11 +438,12 @@ class Application:
             "Listening...",
             active_peer=packet.sender,
         )
-        if self._incoming_next_seq is None or packet.flags & FLAG_START:
+        if self._incoming_next_seq is None or (packet.flags & FLAG_START and is_new_stream):
             log.info(
-                "incoming stream start id=%s sender=%s seq=%s flags=%s codec=%s payload=%s",
+                "incoming stream start id=%s sender=%s transport=%s seq=%s flags=%s codec=%s payload=%s",
                 packet.stream_id.hex(),
                 packet.sender,
+                transport,
                 packet.sequence,
                 packet.flags,
                 packet.codec,
@@ -430,6 +451,7 @@ class Application:
             )
             self._incoming_next_seq = packet.sequence
             self._incoming_started = False
+            self._incoming_transport = transport
             self._incoming_packets.clear()
             self._incoming_end_seq = None
             if self._playout_task:
@@ -451,6 +473,11 @@ class Application:
                 self._decoder = None
                 return
 
+        # When the same stream is delivered over both routes, prefer the ESP
+        # low-latency profile as long as playout has not started yet.
+        if not self._incoming_started and transport == "ESP":
+            self._incoming_transport = "ESP"
+
         if packet.payload:
             self._incoming_packets[packet.sequence] = packet.payload
         if packet.redundant_payload and packet.sequence > 0:
@@ -461,8 +488,13 @@ class Application:
                 self._incoming_packets[missing_seq] = packet.redundant_payload
 
         contiguous_ready = self._contiguous_buffered_frames()
+        prebuffer_frames = (
+            config.ESPNOW_RECEIVE_PREBUFFER_FRAMES
+            if self._incoming_transport == "ESP"
+            else config.RECEIVE_PREBUFFER_FRAMES
+        )
         if not self._incoming_started and (
-            contiguous_ready >= config.RECEIVE_PREBUFFER_FRAMES or packet.flags & FLAG_END
+            contiguous_ready >= prebuffer_frames or packet.flags & FLAG_END
         ):
             self._incoming_started = True
             if not self._playout_task or self._playout_task.done():
@@ -492,9 +524,17 @@ class Application:
 
     async def _playout_loop(self):
         frame_interval = config.AUDIO_FRAME_MS / 1000.0
-        missing_grace = config.PLAYOUT_MISSING_GRACE_MS / 1000.0
-        rebuffer_low = config.PLAYOUT_REBUFFER_LOW_FRAMES
-        rebuffer_resume = max(rebuffer_low, config.PLAYOUT_REBUFFER_RESUME_FRAMES)
+        transport = self._incoming_transport
+        if transport == "ESP":
+            missing_grace = config.ESPNOW_PLAYOUT_MISSING_GRACE_MS / 1000.0
+            rebuffer_low = config.ESPNOW_PLAYOUT_REBUFFER_LOW_FRAMES
+            rebuffer_resume = max(rebuffer_low, config.ESPNOW_PLAYOUT_REBUFFER_RESUME_FRAMES)
+            prefill_frames = config.ESPNOW_PLAYOUT_PREFILL_FRAMES
+        else:
+            missing_grace = config.PLAYOUT_MISSING_GRACE_MS / 1000.0
+            rebuffer_low = config.PLAYOUT_REBUFFER_LOW_FRAMES
+            rebuffer_resume = max(rebuffer_low, config.PLAYOUT_REBUFFER_RESUME_FRAMES)
+            prefill_frames = config.PLAYOUT_PREFILL_FRAMES
         loop = asyncio.get_running_loop()
         next_deadline = loop.time()
         stream_id = self.stream_tracker.current_stream_id.hex() if self.stream_tracker.current_stream_id else ""
@@ -538,7 +578,7 @@ class Application:
                         log.warning("decoder conceal failed at seq=%s: %s", self._incoming_next_seq, exc)
                         pcm = b""
                 if pcm:
-                    await self.player.put(pcm)
+                    await self.player.put(pcm, prefill_frames=prefill_frames)
                 self._incoming_next_seq += 1
                 if self._incoming_end_seq is not None and self._incoming_next_seq > self._incoming_end_seq:
                     break
@@ -548,8 +588,9 @@ class Application:
             raise
         finally:
             log.info(
-                "playout ended id=%s start_seq=%s next_seq=%s end_seq=%s decoded=%s concealed=%s buffered=%s running=%s",
+                "playout ended id=%s transport=%s start_seq=%s next_seq=%s end_seq=%s decoded=%s concealed=%s buffered=%s running=%s",
                 stream_id,
+                transport,
                 started_seq,
                 self._incoming_next_seq,
                 self._incoming_end_seq,

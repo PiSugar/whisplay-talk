@@ -1,0 +1,13 @@
+[Unit]
+Description=Whisplay Talk ESP-NOW bridge
+Requires=nexmon-monitor.service
+After=nexmon-monitor.service network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/whisplay-espnow-bridge
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

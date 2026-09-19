@@ -17,10 +17,10 @@ class AudioPlayer:
         self._stderr_task: asyncio.Task | None = None
         self._start_lock = asyncio.Lock()
         self._silence = b"\x00" * config.AUDIO_FRAME_BYTES
-        self._prefill_frames = 6
+        self._prefill_frames = max(0, config.PLAYOUT_PREFILL_FRAMES)
         self._alsa = self._load_alsaaudio()
         self._pcm = None
-        self._use_alsa = self._alsa is not None
+        self._use_alsa = config.AUDIO_PLAYER_BACKEND == "alsa" and self._alsa is not None
         self._dump = None
 
     def _load_alsaaudio(self):
@@ -36,12 +36,14 @@ class AudioPlayer:
                         continue
             return None
 
-    async def _ensure_started(self):
+    async def _ensure_started(self, prefill_frames: int | None = None):
         async with self._start_lock:
             if self.is_active():
                 return
             if self._task and not self._task.done():
                 return
+            if prefill_frames is not None:
+                self._prefill_frames = max(0, prefill_frames)
             self._queue = asyncio.Queue()
             self._start()
 
@@ -149,12 +151,26 @@ class AudioPlayer:
                 except Exception:
                     pass
 
-    async def put(self, data: bytes):
-        await self._ensure_started()
+    async def put(self, data: bytes, prefill_frames: int | None = None):
+        await self._ensure_started(prefill_frames)
         await self._queue.put(data)
 
     async def stop(self):
         async with self._start_lock:
+            # Stop the child first. A blocked pipe write in the executor cannot
+            # consume the queue sentinel until aplay exits and closes the pipe.
+            process = self._process
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            if self._pcm:
+                try:
+                    self._pcm.close()
+                except Exception:
+                    pass
+                self._pcm = None
             if self._task:
                 await self._queue.put(None)
                 try:
@@ -162,21 +178,21 @@ class AudioPlayer:
                 except Exception:
                     self._task.cancel()
                 self._task = None
-            if self._pcm:
+            if self._stderr_task:
                 try:
-                    self._pcm.close()
+                    await asyncio.wait_for(self._stderr_task, timeout=1)
                 except Exception:
-                    pass
-                self._pcm = None
-            if self._process:
+                    self._stderr_task.cancel()
+                self._stderr_task = None
+            if process:
                 try:
-                    self._process.wait(timeout=4)
+                    process.wait(timeout=1)
                 except Exception:
                     try:
-                        self._process.terminate()
-                        self._process.wait(timeout=1)
+                        process.kill()
+                        process.wait(timeout=1)
                     except Exception:
-                        self._process.kill()
+                        pass
                 self._process = None
             if self._dump:
                 try:

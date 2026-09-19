@@ -18,6 +18,7 @@ class Peer:
     address: str
     online: bool
     latency_ms: int | None = None
+    transport: str = "TCP"
 
 
 @dataclass

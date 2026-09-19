@@ -140,12 +140,13 @@ class DisplayState:
         self.battery_color = (128, 128, 128)
         self.wifi_signal_level = 0
         self.vpn_connected = False
+        self.esp_channel = None
         self.active_peer = ""
 
     def update(self, **kwargs):
         with self.lock:
             for key, value in kwargs.items():
-                if hasattr(self, key) and value is not None:
+                if hasattr(self, key) and (value is not None or key == "esp_channel"):
                     setattr(self, key, value)
 
     def snapshot(self):
@@ -160,6 +161,7 @@ class DisplayState:
                 "battery_color": self.battery_color,
                 "wifi_signal_level": self.wifi_signal_level,
                 "vpn_connected": self.vpn_connected,
+                "esp_channel": self.esp_channel,
                 "active_peer": self.active_peer,
             }
 
@@ -205,9 +207,17 @@ class UIRenderer(threading.Thread):
         draw = ImageDraw.Draw(img)
 
         accent = snap["accent"]
-        status_box_top = 42
-        status_box_bottom = 106
+        status_box_top = 48
+        status_box_bottom = 112
         draw.text((14, 10), _APP_TITLE, font=self._body_font, fill=(220, 230, 235))
+        esp_channel = snap.get("esp_channel")
+        if esp_channel is not None:
+            draw.text(
+                (14, 28),
+                f"ESP CH {esp_channel}",
+                font=self._battery_font_tiny,
+                fill=(90, 210, 255),
+            )
         draw.rounded_rectangle((8, status_box_top, width - 8, status_box_bottom), radius=16, fill=(18, 28, 32), outline=accent, width=2)
         show_talk_icon = snap["status"] == "Receiving"
         talk_box_w = int(round(_TALK_ICON_BASE_BOX[0] * _TALK_ICON_SCALE))
@@ -223,12 +233,13 @@ class UIRenderer(threading.Thread):
         draw.rounded_rectangle((8, 118, width - 8, 220), radius=16, fill=(15, 18, 20))
         y = 132
         active_peer = (snap.get("active_peer") or "").strip().lower()
+        local_name = (snap.get("device_name") or "").strip()
         for line in _wrap_text(snap["main_text"] or "Waiting...", self._body_font, width - 40, 6):
             fill = (230, 235, 240)
             normalized = line.lower()
             if active_peer and active_peer in normalized:
                 fill = (255, 220, 90)
-            draw.text((18, y), line, font=self._body_font, fill=fill)
+            self._draw_peer_line(draw, 18, y, line, local_name, fill)
             y += 18
 
         draw.rounded_rectangle((8, 232, width - 8, height - 8), radius=14, fill=(18, 28, 32))
@@ -238,6 +249,27 @@ class UIRenderer(threading.Thread):
             draw.text((18, 242 + (index * 16)), line, font=self._footer_font, fill=(170, 200, 190))
 
         self.board.draw_image(0, 0, width, height, image_to_rgb565(img))
+
+    def _draw_peer_line(self, draw, x: int, y: int, line: str, local_name: str, fill):
+        """Draw only the local device name in blue, leaving its route label unchanged."""
+        if not local_name:
+            draw.text((x, y), line, font=self._body_font, fill=fill)
+            return
+        for prefix in ("\u25cf ", "\u25cb "):
+            name_start = len(prefix)
+            name_end = name_start + len(local_name)
+            if not line.lower().startswith((prefix + local_name).lower()):
+                continue
+            before = line[:name_start]
+            name = line[name_start:name_end]
+            after = line[name_end:]
+            draw.text((x, y), before, font=self._body_font, fill=fill)
+            x += _measure_text(self._body_font, before)
+            draw.text((x, y), name, font=self._body_font, fill=(70, 150, 255))
+            x += _measure_text(self._body_font, name)
+            draw.text((x, y), after, font=self._body_font, fill=fill)
+            return
+        draw.text((x, y), line, font=self._body_font, fill=fill)
 
     def _draw_status_icons(self, image: Image.Image, draw: ImageDraw.Draw, snap: dict, width: int):
         cursor_x = width - 18

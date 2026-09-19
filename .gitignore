@@ -1,5 +1,10 @@
 venv/
+.venv-esp32/
 .env
 .pycache/
 __pycache__/
 .pycache_tmp
+.DS_Store
+firmware/**/.pio/
+firmware/**/compile_commands.json
+firmware/atom-s3r-espnow-probe/backups/

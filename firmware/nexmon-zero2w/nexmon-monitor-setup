@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+base_iface="${NEXMON_BASE_IFACE:-wlan0}"
+monitor_iface="${NEXMON_MON_IFACE:-mon0}"
+
+attempt=0
+while [ ! -e "/sys/class/net/${base_iface}" ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 30 ]; then
+        echo "interface ${base_iface} did not appear" >&2
+        exit 1
+    fi
+    sleep 1
+done
+
+# A previous bridge shutdown or crash may have left firmware scan suppression
+# enabled. Always restore normal managed-Wi-Fi discovery before waiting for an AP.
+/usr/local/bin/nexutil -I "$base_iface" -c0 || true
+
+# Give a configured managed connection a short head start. Do not wait a full
+# minute when the device is intentionally being used away from any access point;
+# the ESP-NOW bridge will select the common offline channel in that case.
+link_attempt=0
+while ! /usr/sbin/iw dev "$base_iface" link | grep -q '^Connected to '; do
+    link_attempt=$((link_attempt + 1))
+    if [ "$link_attempt" -ge 15 ]; then
+        echo "warning: ${base_iface} is not associated; enabling monitor mode anyway" >&2
+        break
+    fi
+    sleep 1
+done
+
+if /usr/sbin/iw dev "$base_iface" link | grep -q '^Connected to '; then
+    # Let association, channel selection, and firmware power state settle.
+    # Creating mon0 in the same instant as association can yield RX-only mode.
+    sleep 5
+fi
+
+# BCM43430 power save can leave pcap injection reporting success while no frame
+# is emitted over the air. Keep the shared managed/monitor PHY fully awake.
+/usr/sbin/iw dev "$base_iface" set power_save off || \
+    echo "warning: could not disable power save on ${base_iface}" >&2
+
+if ! /usr/sbin/iw dev "$monitor_iface" info >/dev/null 2>&1; then
+    phy_index="$(/usr/sbin/iw dev "$base_iface" info | awk '$1 == "wiphy" { print $2; exit }')"
+    if [ -z "$phy_index" ]; then
+        echo "could not determine wiphy for ${base_iface}" >&2
+        exit 1
+    fi
+    /usr/sbin/iw phy "phy${phy_index}" interface add "$monitor_iface" type monitor
+fi
+
+/usr/sbin/ip link set "$monitor_iface" up
+
+# The ioctl must be sent through the managed interface. Omitting -I after
+# mon0 exists can select the wrong netdev and leave firmware monitor mode off.
+/usr/local/bin/nexutil -I "$base_iface" -m2
+
+# NetworkManager may reapply its connection power policy while the monitor
+# interface is being created, so enforce this once more after mode 2 is active.
+/usr/sbin/iw dev "$base_iface" set power_save off || true
+
+mode="$(/usr/local/bin/nexutil -I "$base_iface" -m 2>/dev/null || true)"
+case "$mode" in
+    *"monitor: 2"*) ;;
+    *)
+        echo "failed to enable Nexmon monitor mode: ${mode:-no response}" >&2
+        exit 1
+        ;;
+esac
+
+echo "Nexmon monitor interface ${monitor_iface} enabled beside ${base_iface}"

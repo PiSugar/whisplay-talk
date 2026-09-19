@@ -1,0 +1,14 @@
+[Unit]
+Description=Nexmon monitor interface for Raspberry Pi Zero 2 W
+After=systemd-modules-load.service network-online.target NetworkManager.service wpa_supplicant.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nexmon-monitor-setup
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=multi-user.target

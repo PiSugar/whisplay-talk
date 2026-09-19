@@ -8,10 +8,11 @@ A P2P voice intercom app for Whisplay HAT, designed for real-time voice broadcas
 
 Core flow:
 - Runs as a `whisplay-daemon` app
-- Discovers online devices through Tailscale `MagicDNS`, using the `whisplay-talk-` hostname prefix
-- While one device holds the talk button, microphone audio is compressed and streamed to all online peers over TCP
+- Discovers online devices concurrently through Tailscale `MagicDNS` and ESP-NOW heartbeats
+- While one device holds the talk button, microphone audio is compressed and sent over every available TCP / ESP-NOW route
 - Other devices play the audio in real time, highlight the active speaker, and show a receive icon in the status box
-- While idle, the screen shows the device list with online state and heartbeat latency
+- While idle, the screen shows the device list with online state, heartbeat latency,
+  and an explicit `[ESP]` or `[TCP]` transport label
 
 ## Screenshots
 
@@ -26,9 +27,10 @@ Core flow:
 - Header:
   Shows the `WhisplayTalk` title plus VPN, Wi-Fi signal, and battery status icons
 - Status card:
-  Shows the current app state, the local device name, and a talk icon on the right while receiving audio
+  Shows the current app state, the local device name, the live `ESP CH n` radio
+  channel, and a talk icon on the right while receiving audio
 - Device list:
-  Keeps showing the peer list even while talking or receiving, with online / offline markers and heartbeat latency such as `kitchen (42ms)`
+  Keeps showing the peer list even while talking or receiving, with online / offline markers, transport labels, and heartbeat latency such as `kitchen [TCP] (42ms)`
 - Active speaker highlight:
   Highlights the device currently speaking in yellow
 - Footer:
@@ -81,6 +83,68 @@ bash install.sh
 - Download the `NotoSansSC-Bold.ttf` font
 - Auto-register the app if `whisplay-daemon` is detected
 
+### Raspberry Pi Zero 2 W Nexmon firmware
+
+The hardware-validated BCM43430/1 Nexmon firmware, CM5-built kernel modules,
+DKMS source package, `nexutil`, boot service, checksums, and instructions are preserved
+in [`firmware/nexmon-zero2w`](firmware/nexmon-zero2w/README.md). This setup keeps
+normal managed Wi-Fi on `wlan0` while adding the same-channel `mon0` interface
+for Radiotap/802.11 capture and injection.
+
+### ESP-NOW transport
+
+On a Zero 2 W with the bundled Nexmon firmware installed, install the privileged
+radio bridge:
+
+```bash
+sudo bash tools/install_espnow_bridge.sh
+```
+
+Use the generated device name or set `WHISPLAY_TALK_DEVICE_NAME`, then launch Talk from
+`whisplay-daemon`. Talk remains unprivileged and exchanges Unix datagrams with
+the root bridge at `/run/whisplay-espnow/bridge.sock`. Discovery uses `WD01`
+broadcast heartbeats and audio keeps the existing `WT01` format. ESP-NOW v1 is
+limited to a 250-byte application payload; redundant audio is automatically
+omitted when necessary. The current transport is broadcast, unencrypted, and
+unauthenticated. `wlan0` and `mon0` coexist but must use the same Wi-Fi channel.
+TCP/Tailscale and ESP-NOW are always started together; there is no transport
+selector. If the fixed local bridge socket is absent, Talk continues with TCP.
+Peer rows show `[ESP]`, `[TCP]`, or `[ESP/TCP]` according to their available routes.
+When managed Wi-Fi is associated, ESP-NOW always follows the AP channel and never
+changes it. When Wi-Fi is unassociated, every updated node falls back to channel 6.
+After 12 seconds without a peer, the bridge performs a randomized low-duty recovery
+scan over channels 1/6/11, announces immediately on every visited channel, and returns
+both updated peers to channel 6 after discovery. This lets two nodes converge when
+they boot away from any access point without disrupting an active Wi-Fi connection.
+While offline, Nexmon scan suppression keeps NetworkManager background scans from
+silently changing the ESP-NOW channel. The bridge briefly restores Wi-Fi scanning
+once per minute while audio is idle so a configured access point can still reconnect.
+For radio reliability, the bridge disables Wi-Fi power saving, uses 1 Mbps DSSS
+with a long preamble, transmits each audio frame four times and each discovery
+heartbeat seven times, and spaces replicas with jitter so one interference burst
+cannot erase every copy. It also periodically refreshes the Nexmon pcap injection
+handle and logs a smoothed peer RSSI every ten seconds for walk testing. The
+Zero 2 W calibration data caps 2.4 GHz near 19.5 dBm; forcing the driver above
+that calibrated limit is intentionally avoided. The default Opus bitrate is
+12 kbps to shorten over-the-air frames.
+
+Run the two-node application-layer smoke test simultaneously on both units:
+
+```bash
+venv/bin/python tools/espnow_app_smoke.py
+```
+
+### AtomS3R voice client
+
+[`firmware/atom-s3r-whisplay-talk`](firmware/atom-s3r-whisplay-talk/README.md)
+contains a standalone client for an M5Stack AtomS3R on the Atomic Voice Base.
+It uses the same `WD01` discovery and `WT01`/Opus audio protocol as the Zero 2 W
+bridge. The LCD shows state and peers; hold the screen button to talk and release
+it to stop. The default build uses ESP-NOW channel 2 and the name `atomic-s3`.
+
+`tools/espnow_audio_probe.py` sends a short Opus test tone from a Raspberry Pi to
+an Atom client for repeatable receive/playback checks.
+
 ## Tailscale Setup
 
 Every device must join the same Tailscale tailnet before `whisplay-talk` can discover peers.
@@ -115,7 +179,11 @@ Important settings:
 - `WHISPLAY_TALK_DEVICE_PREFIX`
   Default: `whisplay-talk-`
 - `WHISPLAY_TALK_DEVICE_NAME`
-  If empty, the system hostname is used. If it does not already have the prefix, the prefix is added automatically.
+  Optional explicit display name. When empty, the first app launch generates a
+  friendly random name such as `amber-otter` and reuses it on later launches.
+- `WHISPLAY_TALK_DEVICE_NAME_FILE`
+  Default: `~/.config/whisplay-talk/device-name`, where an automatically generated
+  name is persisted. Setting `WHISPLAY_TALK_DEVICE_NAME` always takes precedence.
 - `WHISPLAY_TALK_TCP_PORT`
   Default: `24680`
 - `WHISPLAY_TALK_APP_HEARTBEAT_TIMEOUT_MS`
@@ -141,7 +209,21 @@ Important settings:
 - `AUDIO_OPUS_ENABLE_FEC`
   Default `1`, enables Opus in-band forward error correction
 - `WHISPLAY_TALK_RECEIVE_PREBUFFER_FRAMES`
-  Default `24`, roughly one second of audio at the current 40ms Opus frame size
+  Standard-network default `24`, retaining the original roughly 960 ms jitter buffer
+- `WHISPLAY_TALK_PLAYOUT_PREFILL_FRAMES`
+  Standard-network default `6`, retaining the original 240 ms ALSA prefill
+- `WHISPLAY_TALK_PLAYOUT_MISSING_GRACE_MS`
+  Standard-network default `200`, retaining the original late-packet grace period
+- `WHISPLAY_TALK_ESPNOW_RECEIVE_PREBUFFER_FRAMES`
+  Default `4`, roughly 160 ms at the current 40 ms Opus frame size
+- `WHISPLAY_TALK_ESPNOW_PLAYOUT_PREFILL_FRAMES`
+  Default `1`, adding only one 40 ms silent device-priming frame for ESP-NOW
+- `WHISPLAY_TALK_ESPNOW_PLAYOUT_MISSING_GRACE_MS`
+  Default `0`; a missing ESP-NOW frame is concealed on its original deadline
+  instead of pausing all following audio
+- `AUDIO_PLAYER_BACKEND`
+  Default `aplay`, which provides a stable 200 ms device buffer; `alsa` keeps the
+  direct Python ALSA backend available for diagnostics
 
 ## Device Naming
 
@@ -165,6 +247,8 @@ For example:
 After renaming a device in Tailscale, wait for the updated `MagicDNS` name to propagate to peers.
 
 `WHISPLAY_TALK_DEVICE_NAME` can still be used as a local override when needed.
+For ESP-NOW this is also the name broadcast to peers. TCP discovery continues to
+use Tailscale MagicDNS names for remote devices.
 
 Also make sure all devices have joined the same Tailscale tailnet.
 
