@@ -11,7 +11,7 @@ firmware_dir=/usr/lib/firmware/brcm
 firmware_name=brcmfmac43436s-sdio.bin
 board_firmware_name=brcmfmac43430-sdio.raspberrypi,model-zero-2-w.bin
 kernel_release="$(uname -r)"
-module_source="$artifact_dir/modules/$kernel_release/brcmfmac.ko.xz"
+module_source="${NEXMON_MODULE_SOURCE:-$artifact_dir/modules/$kernel_release/brcmfmac.ko.xz}"
 module_dir="/lib/modules/$kernel_release/updates/dkms"
 module_target="$module_dir/brcmfmac.ko.xz"
 
@@ -34,8 +34,7 @@ for file in \
 done
 
 if [ ! -e "$module_source" ]; then
-    echo "no prebuilt Nexmon module for ${kernel_release}" >&2
-    echo "build it on the CM5 with ./build-modules.sh ${kernel_release}" >&2
+    echo "Nexmon module not found: ${module_source}" >&2
     exit 1
 fi
 
@@ -89,4 +88,4 @@ fi
 systemctl daemon-reload
 systemctl enable nexmon-monitor.service
 
-echo "Prebuilt Nexmon bundle installed for ${kernel_release}. Reboot to load it."
+echo "Nexmon bundle installed for ${kernel_release}. Reboot to load it."

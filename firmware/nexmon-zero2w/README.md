@@ -16,9 +16,9 @@ transmit Radiotap/802.11 ESP-NOW-compatible action frames on Raspberry Pi Zero
   - `6.18.50+rpt-rpi-v8`
 - Architecture: `aarch64`
 
-The two kernel-specific modules are prebuilt on the aarch64 CM5. The DKMS
-package is retained as the patched brcmfmac source input, but the Zero 2 W
-installer does not compile it locally.
+Common kernel-specific modules are prebuilt on the aarch64 CM5. The DKMS
+package is retained as the patched brcmfmac source input so an unlisted running
+kernel can also be built locally on a 64-bit Zero 2 W.
 
 ## Build modules on the CM5
 
@@ -35,14 +35,31 @@ The script verifies that it is running on `aarch64`, builds each target in an
 isolated directory, checks module vermagic, and writes the compressed modules
 under `modules/<kernel-release>/`.
 
-## Install
+## Upgrade a Zero 2 W
 
 ```sh
-cd firmware/nexmon-zero2w
-sha256sum -c SHA256SUMS
-sudo ./install.sh
+sudo bash tools/upgrade_espnow_firmware.sh
 sudo reboot
+sudo bash tools/install_espnow_bridge.sh
 ```
+
+Run the commands from the repository root. The normal project `install.sh` does
+not modify Wi-Fi firmware: this explicit upgrade is required only for users who
+want the optional ESP-NOW transport.
+
+`upgrade_espnow_firmware.sh` verifies `SHA256SUMS` and selects
+`modules/$(uname -r)/brcmfmac.ko.xz` when available. If no exact match exists,
+it extracts the bundled patched driver source and builds a temporary module
+against `/lib/modules/$(uname -r)/build` on the device. Missing build tools and
+kernel headers are installed through APT when possible. If the package archive
+does not provide headers for the running kernel, update and reboot into a kernel
+with matching headers, then rerun the command. Use `--no-build` to require a
+prebuilt module and fail rather than compiling locally.
+
+The Zero 2 W must use a 64-bit (`aarch64`) Raspberry Pi OS. Local compilation
+uses two jobs by default to stay within its memory limit; set
+`NEXMON_BUILD_JOBS` explicitly to change that. Compilation happens under
+`/tmp`, and its intermediate files are removed after installation.
 
 After reboot:
 
@@ -59,9 +76,10 @@ non-functional monitor data path. Both interfaces share one physical radio and
 therefore must use the same channel. Association and normal IP traffic on
 `wlan0` remain available while `mon0` captures or injects frames.
 
-The installer selects the prebuilt module matching `uname -r` and makes
-one-time `.pre-nexmon` backups of the existing module and board firmware
-links/files. It does not remove the normal Wi-Fi configuration.
+The installer makes one-time `.pre-nexmon` backups of the existing module and
+board firmware links/files. It does not remove the normal Wi-Fi configuration.
+Keep SSH or serial-console recovery access available when replacing wireless
+firmware. The script does not reboot automatically.
 
 ## Injection
 

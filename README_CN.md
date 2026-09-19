@@ -83,15 +83,28 @@ bash install.sh
 
 ### Raspberry Pi Zero 2 W Nexmon 固件
 
-已经过实机验证的 BCM43430/1 Nexmon 固件、CM5 预编译内核模块、DKMS 源码包、`nexutil`、
-开机服务、校验值和安装说明已保存在
-[`firmware/nexmon-zero2w`](firmware/nexmon-zero2w/README.md)。该配置保留
+ESP-NOW 是可选功能。普通的 `bash install.sh` 不会替换 Wi-Fi 固件，也不会安装
+特权 radio bridge；不做固件升级时，Talk 仍可正常使用 TCP 通讯。
+
+需要 ESP-NOW 的用户可在 64 位 Raspberry Pi Zero 2 W 上显式执行：
+
+```bash
+sudo bash tools/upgrade_espnow_firmware.sh
+sudo reboot
+sudo bash tools/install_espnow_bridge.sh
+```
+
+升级脚本会先校验仓库内的固件与驱动文件，并精确匹配当前运行内核。如果已有对应的
+预编译模块，就直接安装；如果没有，脚本会尽可能自动安装编译工具和当前内核 headers，
+然后在这台 Zero 2 W 本机编译匹配模块。固件、CM5 预编译模块、DKMS 源码包、一次性
+备份机制和恢复说明保存在
+[`firmware/nexmon-zero2w`](firmware/nexmon-zero2w/README.md)。升级后仍保留
 `wlan0` 的普通 Wi-Fi 联网能力，同时提供同信道的 `mon0` 接口，用于
 Radiotap/802.11 抓包和注入。
 
 ### ESP-NOW 传输
 
-在已安装仓库内 Nexmon 固件的 Zero 2 W 上安装特权 radio bridge：
+固件升级并重启后，再安装可选的特权 radio bridge：
 
 ```bash
 sudo bash tools/install_espnow_bridge.sh

@@ -85,16 +85,33 @@ bash install.sh
 
 ### Raspberry Pi Zero 2 W Nexmon firmware
 
-The hardware-validated BCM43430/1 Nexmon firmware, CM5-built kernel modules,
-DKMS source package, `nexutil`, boot service, checksums, and instructions are preserved
-in [`firmware/nexmon-zero2w`](firmware/nexmon-zero2w/README.md). This setup keeps
-normal managed Wi-Fi on `wlan0` while adding the same-channel `mon0` interface
-for Radiotap/802.11 capture and injection.
+ESP-NOW is optional. The normal `bash install.sh` path does not replace the Wi-Fi
+firmware or install the privileged radio bridge, and Talk works over TCP without
+either component.
+
+Users who want ESP-NOW on a 64-bit Raspberry Pi Zero 2 W can run the firmware
+upgrade explicitly:
+
+```bash
+sudo bash tools/upgrade_espnow_firmware.sh
+sudo reboot
+sudo bash tools/install_espnow_bridge.sh
+```
+
+The upgrade script verifies the bundled artifacts and first looks for a prebuilt
+module matching the running kernel exactly. If one exists, it is installed
+directly. Otherwise the script installs the required build tools/headers when
+possible and builds a matching module locally on the Zero 2 W. The firmware,
+CM5-built modules, DKMS source package, one-time backup behavior, and recovery
+notes are documented in
+[`firmware/nexmon-zero2w`](firmware/nexmon-zero2w/README.md). The resulting setup
+keeps normal managed Wi-Fi on `wlan0` while adding the same-channel `mon0`
+interface for Radiotap/802.11 capture and injection.
 
 ### ESP-NOW transport
 
-On a Zero 2 W with the bundled Nexmon firmware installed, install the privileged
-radio bridge:
+After upgrading the firmware and rebooting, install the optional privileged radio
+bridge:
 
 ```bash
 sudo bash tools/install_espnow_bridge.sh
