@@ -1,0 +1,16 @@
+[package]
+name = "whisplay-espnow-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+linux-runtime = []
+
+[dependencies]
+libc = "0.2.189"
+
+[[bin]]
+name = "whisplay-espnow-bridge"
+path = "src/main.rs"
+required-features = ["linux-runtime"]

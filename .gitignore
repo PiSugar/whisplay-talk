@@ -8,3 +8,4 @@ __pycache__/
 firmware/**/.pio/
 firmware/**/compile_commands.json
 firmware/atom-s3r-espnow-probe/backups/
+rust/**/target/

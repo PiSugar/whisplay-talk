@@ -36,6 +36,8 @@ class HybridAudioTransport:
             lambda packet, source: on_packet(packet, source, "ESP")
         )
         self.espnow_available = False
+        self._tcp_pending: tuple | None = None
+        self._tcp_worker_task: asyncio.Task | None = None
 
     async def start(self):
         await self.tcp.start()
@@ -47,6 +49,14 @@ class HybridAudioTransport:
             log.warning("ESP-NOW bridge unavailable; continuing with TCP: %s", exc)
 
     async def stop(self):
+        if self._tcp_worker_task and not self._tcp_worker_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self._tcp_worker_task), timeout=0.5)
+            except asyncio.TimeoutError:
+                self._tcp_worker_task.cancel()
+                await asyncio.gather(self._tcp_worker_task, return_exceptions=True)
+        self._tcp_worker_task = None
+        self._tcp_pending = None
         await self.espnow.stop()
         self.espnow_available = False
         await self.tcp.stop()
@@ -63,24 +73,42 @@ class HybridAudioTransport:
         redundant_payload: bytes = b"",
     ):
         tcp_peers, espnow_peers = split_routes(peers)
-        sends = []
         if tcp_peers:
-            sends.append(
-                self.tcp.send_frame(
-                    sender, tcp_peers, stream_id, sequence, flags, codec, payload, redundant_payload
-                )
+            # TCP is a best-effort real-time mirror.  A disconnected route
+            # must never stall capture or ESP-NOW; while a write is pending,
+            # retain only the newest frame (including the final END packet).
+            self._tcp_pending = (
+                sender,
+                tcp_peers,
+                stream_id,
+                sequence,
+                flags,
+                codec,
+                payload,
+                redundant_payload,
             )
-        if espnow_peers and self.espnow_available:
-            sends.append(
-                self.espnow.send_frame(
+            if not self._tcp_worker_task or self._tcp_worker_task.done():
+                self._tcp_worker_task = asyncio.create_task(self._tcp_send_worker())
+        # ESP-NOW audio is broadcast by design. Discovery improves the UI but
+        # is never a prerequisite for transmitting.
+        if self.espnow_available:
+            try:
+                await self.espnow.send_frame(
                     sender, espnow_peers, stream_id, sequence, flags, codec, payload, redundant_payload
                 )
-            )
-        if sends:
-            results = await asyncio.gather(*sends, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    log.warning("transport send failed: %s", result)
+            except Exception as exc:
+                log.warning("ESP-NOW send failed: %s", exc)
+
+    async def _tcp_send_worker(self):
+        while self._tcp_pending is not None:
+            pending = self._tcp_pending
+            self._tcp_pending = None
+            try:
+                await self.tcp.send_frame(*pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("TCP send failed: %s", exc)
 
     @staticmethod
     def new_stream_id() -> bytes:
@@ -185,9 +213,12 @@ class HybridDiscovery:
     def espnow_channel(self) -> int | None:
         if not self.transport.espnow_available:
             return None
-        if not self.espnow.online_peers():
-            return None
         return self.transport.espnow.current_channel
+
+    def espnow_channel_mode(self) -> str | None:
+        if self.espnow_channel() is None:
+            return None
+        return self.transport.espnow.channel_mode
 
     def display_status(self) -> tuple[str, str, str]:
         if self.status == "ready":

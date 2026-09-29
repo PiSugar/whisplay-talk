@@ -9,7 +9,7 @@ A P2P voice intercom app for Whisplay HAT, designed for real-time voice broadcas
 Core flow:
 - Runs as a `whisplay-daemon` app
 - Discovers online devices concurrently through Tailscale `MagicDNS` and ESP-NOW heartbeats
-- While one device holds the talk button, microphone audio is compressed and sent over every available TCP / ESP-NOW route
+- While one device holds the talk button, microphone audio uses available TCP routes and is always broadcast over ESP-NOW without requiring a discovered peer
 - Other devices play the audio in real time, highlight the active speaker, and show a receive icon in the status box
 - While idle, the screen shows the device list with online state, heartbeat latency,
   and an explicit `[ESP]` or `[TCP]` transport label
@@ -27,8 +27,8 @@ Core flow:
 - Header:
   Shows the `WhisplayTalk` title plus VPN, Wi-Fi signal, and battery status icons
 - Status card:
-  Shows the current app state, the local device name, the live `ESP CH n` radio
-  channel, and a talk icon on the right while receiving audio
+  Always shows the live `ESP CH n` radio channel when the ESP bridge is available,
+  shows `Switching to CH n...` while tuning, and displays a receive icon for audio
 - Device list:
   Keeps showing the peer list even while talking or receiving, with online / offline markers, transport labels, and heartbeat latency such as `kitchen [TCP] (42ms)`
 - Active speaker highlight:
@@ -95,7 +95,7 @@ upgrade explicitly:
 ```bash
 sudo bash tools/upgrade_espnow_firmware.sh
 sudo reboot
-sudo bash tools/install_espnow_bridge.sh
+bash tools/install_espnow_bridge.sh
 ```
 
 The upgrade script verifies the bundled artifacts and first looks for a prebuilt
@@ -114,8 +114,25 @@ After upgrading the firmware and rebooting, install the optional privileged radi
 bridge:
 
 ```bash
-sudo bash tools/install_espnow_bridge.sh
+bash tools/install_espnow_bridge.sh
 ```
+
+The privileged bridge is implemented in Rust under
+[`rust/espnow-bridge`](rust/espnow-bridge). The installer uses an existing release
+binary or builds it locally with Cargo on a 64-bit Zero 2 W. To build once on the
+CM5 and reuse the aarch64 binary:
+
+```bash
+bash tools/build_espnow_bridge_rust.sh /tmp/whisplay-espnow-bridge
+WHISPLAY_ESPNOW_BRIDGE_BINARY=/tmp/whisplay-espnow-bridge \
+  bash tools/install_espnow_bridge.sh
+```
+
+The Rust process owns AF_PACKET receive, libpcap injection, channel recovery,
+RF duplicate filtering, and link statistics. The Python Talk process keeps the
+same local Unix-datagram protocol, so application and over-the-air packet formats
+remain compatible during rolling upgrades. `network/espnow_bridge.py` is retained
+as a readable fallback/reference but is no longer installed by the bridge installer.
 
 Use the generated device name or set `WHISPLAY_TALK_DEVICE_NAME`, then launch Talk from
 `whisplay-daemon`. Talk remains unprivileged and exchanges Unix datagrams with
@@ -127,20 +144,33 @@ unauthenticated. `wlan0` and `mon0` coexist but must use the same Wi-Fi channel.
 TCP/Tailscale and ESP-NOW are always started together; there is no transport
 selector. If the fixed local bridge socket is absent, Talk continues with TCP.
 Peer rows show `[ESP]`, `[TCP]`, or `[ESP/TCP]` according to their available routes.
-When managed Wi-Fi is associated, ESP-NOW always follows the AP channel and never
-changes it. When Wi-Fi is unassociated, every updated node falls back to channel 6.
-After 12 seconds without a peer, the bridge performs a randomized low-duty recovery
-scan over channels 1/6/11, announces immediately on every visited channel, and returns
+In the default `AUTO` mode, managed Wi-Fi association makes ESP-NOW follow the AP
+channel. The PiSugar custom button can override this at runtime: double-tap advances
+from channel 1 through 13 (wrapping after 13) and selects `FIXED` mode; long-press
+returns to `AUTO`. The LCD shows `ESP CH n AUTO` or `ESP CH n FIXED`, and
+`Switching to CH n...` during tuning. ESP audio broadcast and reception do not depend
+on a peer already appearing in the device list. A fixed channel
+retunes the single shared radio away from the AP and can therefore interrupt normal
+Wi-Fi until AUTO is restored. The PiSugar single-tap desktop action is left unchanged.
+The bridge suppresses background roaming scans while it is running so
+the shared PHY is not taken off-channel; the existing Wi-Fi association remains up,
+and normal scanning is restored when the bridge exits. When Wi-Fi is unassociated,
+every updated node falls back to channel 6.
+After 12 seconds without a peer, the bridge follows a shared three-second slot schedule
+over channels 1/6/11, announces immediately on every visited channel, and returns
 both updated peers to channel 6 after discovery. This lets two nodes converge when
 they boot away from any access point without disrupting an active Wi-Fi connection.
-While offline, Nexmon scan suppression keeps NetworkManager background scans from
-silently changing the ESP-NOW channel. The bridge briefly restores Wi-Fi scanning
+While offline, the bridge briefly restores Wi-Fi scanning
 once per minute while audio is idle so a configured access point can still reconnect.
 For radio reliability, the bridge disables Wi-Fi power saving, uses 1 Mbps DSSS
-with a long preamble, transmits each audio frame four times and each discovery
-heartbeat seven times, and spaces replicas with jitter so one interference burst
-cannot erase every copy. It also periodically refreshes the Nexmon pcap injection
-handle and logs a smoothed peer RSSI every ten seconds for walk testing. The
+with a long preamble, and spaces replicas with jitter so one interference burst
+cannot erase every copy. Discovery heartbeats use seven copies; audio adapts
+between two and five copies according to the weakest recently heard peer, reducing
+airtime congestion at close range while adding protection near the receive edge.
+The receive side drops short-window RF replicas before they reach Talk. It also
+recovers a stale Nexmon injection handle in place and logs ten-second link statistics,
+including RSSI, duplicate ratio, selected audio copy count, and estimated missing
+audio sequences. The
 Zero 2 W calibration data caps 2.4 GHz near 19.5 dBm; forcing the driver above
 that calibrated limit is intentionally avoided. The default Opus bitrate is
 12 kbps to shorten over-the-air frames.
@@ -150,6 +180,10 @@ Run the two-node application-layer smoke test simultaneously on both units:
 ```bash
 venv/bin/python tools/espnow_app_smoke.py
 ```
+
+For a non-audio link measurement, run `tools/espnow_link_test.py` simultaneously
+on both units. It sends 100 harmless probe payloads at the normal 40 ms audio
+cadence and reports unique frames received and loss in each direction.
 
 ### AtomS3R voice client
 

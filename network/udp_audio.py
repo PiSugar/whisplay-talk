@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 import struct
 import time
 import uuid
@@ -14,6 +15,8 @@ TYPE_AUDIO = 1
 FLAG_START = 1
 FLAG_END = 2
 HEADER = struct.Struct("!4sBBH16sIHHB")
+TIMESTAMP_MAGIC = b"TS01"
+TIMESTAMP_TRAILER = struct.Struct("!4sQ")
 
 
 @dataclass
@@ -25,6 +28,7 @@ class AudioPacket:
     codec: int
     payload: bytes
     redundant_payload: bytes
+    sent_at_ms: int | None = None
 
 
 def encode_packet(
@@ -35,9 +39,10 @@ def encode_packet(
     codec: int,
     payload: bytes,
     redundant_payload: bytes = b"",
+    sent_at_ms: int | None = None,
 ) -> bytes:
     sender_bytes = sender.encode("utf-8")
-    return (
+    packet = (
         HEADER.pack(
             MAGIC,
             TYPE_AUDIO,
@@ -53,6 +58,9 @@ def encode_packet(
         + payload
         + redundant_payload
     )
+    if sent_at_ms is not None:
+        packet += TIMESTAMP_TRAILER.pack(TIMESTAMP_MAGIC, sent_at_ms)
+    return packet
 
 
 def decode_packet(data: bytes) -> AudioPacket | None:
@@ -69,6 +77,12 @@ def decode_packet(data: bytes) -> AudioPacket | None:
     payload = data[offset:offset + payload_len]
     offset += payload_len
     redundant_payload = data[offset:offset + redundant_len]
+    offset += redundant_len
+    sent_at_ms = None
+    if len(data) >= offset + TIMESTAMP_TRAILER.size:
+        timestamp_magic, timestamp = TIMESTAMP_TRAILER.unpack_from(data, offset)
+        if timestamp_magic == TIMESTAMP_MAGIC:
+            sent_at_ms = timestamp
     return AudioPacket(
         sender=sender,
         stream_id=stream_id,
@@ -77,6 +91,7 @@ def decode_packet(data: bytes) -> AudioPacket | None:
         codec=codec,
         payload=payload,
         redundant_payload=redundant_payload,
+        sent_at_ms=sent_at_ms,
     )
 
 
@@ -95,6 +110,7 @@ class UdpAudioTransport:
         self.on_packet = on_packet
         self._server: asyncio.base_events.Server | None = None
         self._writers: dict[str, asyncio.StreamWriter] = {}
+        self._retry_after: dict[str, float] = {}
         self._writer_lock = asyncio.Lock()
 
     async def start(self):
@@ -142,7 +158,20 @@ class UdpAudioTransport:
             writer = self._writers.get(address)
             if writer and not writer.is_closing():
                 return writer
-            reader, writer = await asyncio.open_connection(address, config.TCP_PORT)
+            _reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(address, config.TCP_PORT),
+                timeout=config.TCP_CONNECT_TIMEOUT_MS / 1000.0,
+            )
+            sock = writer.get_extra_info("socket")
+            if sock is not None:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                if hasattr(socket, "TCP_USER_TIMEOUT"):
+                    sock.setsockopt(
+                        socket.IPPROTO_TCP,
+                        socket.TCP_USER_TIMEOUT,
+                        config.TCP_USER_TIMEOUT_MS,
+                    )
+            writer.transport.set_write_buffer_limits(high=2048, low=512)
             self._writers[address] = writer
             return writer
 
@@ -152,7 +181,7 @@ class UdpAudioTransport:
         if writer:
             writer.close()
             try:
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
             except Exception:
                 pass
 
@@ -169,17 +198,39 @@ class UdpAudioTransport:
     ):
         if not peers:
             return
-        packet = encode_packet(sender, stream_id, sequence, flags, codec, payload, redundant_payload)
+        packet = encode_packet(
+            sender,
+            stream_id,
+            sequence,
+            flags,
+            codec,
+            payload,
+            redundant_payload,
+            sent_at_ms=int(time.time() * 1000),
+        )
         framed = struct.pack("!I", len(packet)) + packet
         for address in peers:
+            now = time.monotonic()
+            if now < self._retry_after.get(address, 0.0):
+                continue
             try:
                 writer = await self._get_writer(address)
                 writer.write(framed)
-                await writer.drain()
+                await asyncio.wait_for(
+                    writer.drain(),
+                    timeout=config.TCP_DRAIN_TIMEOUT_MS / 1000.0,
+                )
                 if flags & FLAG_END:
                     await self._close_writer(address)
+                    self._retry_after.pop(address, None)
+            except asyncio.CancelledError:
+                await self._close_writer(address)
+                raise
             except Exception as exc:
                 log.warning("tcp send failed to %s: %s", address, exc)
+                self._retry_after[address] = time.monotonic() + (
+                    config.TCP_RETRY_COOLDOWN_MS / 1000.0
+                )
                 await self._close_writer(address)
 
     @staticmethod

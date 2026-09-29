@@ -141,6 +141,8 @@ class DisplayState:
         self.wifi_signal_level = 0
         self.vpn_connected = False
         self.esp_channel = None
+        self.esp_channel_mode = None
+        self.esp_enabled = False
         self.active_peer = ""
 
     def update(self, **kwargs):
@@ -162,6 +164,8 @@ class DisplayState:
                 "wifi_signal_level": self.wifi_signal_level,
                 "vpn_connected": self.vpn_connected,
                 "esp_channel": self.esp_channel,
+                "esp_channel_mode": self.esp_channel_mode,
+                "esp_enabled": self.esp_enabled,
                 "active_peer": self.active_peer,
             }
 
@@ -211,10 +215,17 @@ class UIRenderer(threading.Thread):
         status_box_bottom = 112
         draw.text((14, 10), _APP_TITLE, font=self._body_font, fill=(220, 230, 235))
         esp_channel = snap.get("esp_channel")
-        if esp_channel is not None:
+        if snap.get("esp_enabled"):
+            channel_mode = snap.get("esp_channel_mode") or "AUTO"
+            if channel_mode == "SWITCHING" and esp_channel is not None:
+                channel_text = f"Switching to CH {esp_channel}..."
+            elif esp_channel is None:
+                channel_text = "ESP CH --"
+            else:
+                channel_text = f"ESP CH {esp_channel} {channel_mode}"
             draw.text(
                 (14, 28),
-                f"ESP CH {esp_channel}",
+                channel_text,
                 font=self._battery_font_tiny,
                 fill=(90, 210, 255),
             )
@@ -282,11 +293,15 @@ class UIRenderer(threading.Thread):
             self._draw_battery(draw, snap, cursor_x, y)
             cursor_x -= icon_gap
 
-        wifi_w = self._measure_wifi_icon(snap.get("wifi_signal_level", 0))
-        if wifi_w > 0:
-            cursor_x -= wifi_w
-            self._draw_wifi(image, snap.get("wifi_signal_level", 0), cursor_x, y - 1)
-            cursor_x -= icon_gap
+        # A fixed ESP-NOW channel deliberately detaches the radio from the
+        # managed Wi-Fi channel.  NetworkManager can keep reporting the old
+        # association for a while, so its signal icon would be misleading.
+        if snap.get("esp_channel_mode") not in {"FIXED", "SWITCHING"}:
+            wifi_w = self._measure_wifi_icon(snap.get("wifi_signal_level", 0))
+            if wifi_w > 0:
+                cursor_x -= wifi_w
+                self._draw_wifi(image, snap.get("wifi_signal_level", 0), cursor_x, y - 1)
+                cursor_x -= icon_gap
 
         vpn_w = self._measure_vpn_icon()
         cursor_x -= vpn_w

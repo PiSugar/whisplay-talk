@@ -81,7 +81,7 @@ class Application:
         self._incoming_queue = asyncio.Queue()
         self._incoming_task = asyncio.create_task(self._incoming_loop())
         self._monitor_task = asyncio.create_task(self._display_loop())
-        self._set_state(self.IDLE, "Waiting for peers", "Hold button to talk")
+        self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
 
     async def stop(self):
         if not self._running:
@@ -132,7 +132,18 @@ class Application:
         accent = accent or self._accent_for_state(status)
         device_name = self.discovery.local_name()
         esp_channel = self.discovery.espnow_channel()
-        snapshot = (status, device_name, main_text, footer_text, accent, active_peer, esp_channel)
+        esp_channel_mode = self.discovery.espnow_channel_mode()
+        snapshot = (
+            status,
+            device_name,
+            main_text,
+            footer_text,
+            accent,
+            active_peer,
+            esp_channel,
+            esp_channel_mode,
+            self.transport.espnow_available,
+        )
         self._state = status
         if snapshot == self._last_ui_snapshot:
             return
@@ -150,6 +161,8 @@ class Application:
             wifi_signal_level=self.network.signal_level,
             vpn_connected=self.discovery.vpn_connected(),
             esp_channel=esp_channel,
+            esp_channel_mode=esp_channel_mode,
+            esp_enabled=self.transport.espnow_available,
             active_peer=active_peer,
         )
         if self.board:
@@ -190,8 +203,12 @@ class Application:
                     wifi_signal_level=self.network.signal_level,
                     vpn_connected=self.discovery.vpn_connected(),
                     esp_channel=self.discovery.espnow_channel(),
+                    esp_channel_mode=self.discovery.espnow_channel_mode(),
+                    esp_enabled=self.transport.espnow_available,
                 )
-            await asyncio.sleep(1)
+            # Channel transitions expose a short SWITCHING state; refresh
+            # quickly enough for it to be visible without slowing radio work.
+            await asyncio.sleep(0.2)
 
     def _reset_incoming_buffer(self):
         self._incoming_packets.clear()
@@ -314,7 +331,7 @@ class Application:
         self._reset_incoming_buffer()
         peers = self.discovery.online_peers()
         addresses = [peer.address for peer in peers]
-        if not addresses:
+        if not addresses and not self.transport.espnow_available:
             self._set_state(self.ERROR, "No online peers", "Waiting for ESP/TCP peers")
             await asyncio.sleep(1)
             self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
@@ -396,8 +413,6 @@ class Application:
             self._set_state(self.IDLE, self._peer_summary_text(), "Hold button to talk")
 
     def _handle_packet(self, packet, addr, transport):
-        if packet.sender == self.discovery.local_name():
-            return
         if self._incoming_queue is not None:
             self._incoming_queue.put_nowait((packet, transport))
 
@@ -417,6 +432,17 @@ class Application:
     async def _handle_incoming_packet(self, packet, transport):
         if self._stream_id is not None:
             return
+        if transport == "TCP" and packet.sent_at_ms is not None:
+            packet_age_ms = int(time.time() * 1000) - packet.sent_at_ms
+            if packet_age_ms > config.TCP_MAX_PACKET_AGE_MS:
+                log.warning(
+                    "dropping stale TCP audio id=%s sender=%s seq=%s age_ms=%s",
+                    packet.stream_id.hex(),
+                    packet.sender,
+                    packet.sequence,
+                    packet_age_ms,
+                )
+                return
         is_new_stream = self.stream_tracker.current_stream_id != packet.stream_id
         if self.stream_tracker.current_stream_id and is_new_stream:
             log.info(
@@ -449,7 +475,14 @@ class Application:
                 packet.codec,
                 len(packet.payload),
             )
-            self._incoming_next_seq = packet.sequence
+            # If the START packet was lost, the first packet we see can still
+            # carry its predecessor. Begin one frame earlier so that explicit
+            # redundancy recovers the opening audio instead of discarding it.
+            self._incoming_next_seq = (
+                packet.sequence - 1
+                if packet.sequence > 0 and packet.redundant_payload
+                else packet.sequence
+            )
             self._incoming_started = False
             self._incoming_transport = transport
             self._incoming_packets.clear()
@@ -520,7 +553,10 @@ class Application:
                 self._incoming_next_seq,
                 self._incoming_started,
             )
-            self._incoming_end_seq = packet.sequence
+            # FLAG_END is normally a control-only packet whose sequence is
+            # one past the final audio frame. Do not synthesize/play an extra
+            # PLC frame at the tail of every transmission.
+            self._incoming_end_seq = packet.sequence if packet.payload else packet.sequence - 1
 
     async def _playout_loop(self):
         frame_interval = config.AUDIO_FRAME_MS / 1000.0
@@ -557,6 +593,20 @@ class Application:
                         await asyncio.sleep(0.01)
                     next_deadline = loop.time()
                 if self._incoming_next_seq not in self._incoming_packets:
+                    # Do not advance merely because the next radio packet has
+                    # not arrived yet. A gap is proven only after a higher
+                    # sequence (or END) is present. Advancing speculatively
+                    # makes the playout cursor outrun a backlogged RF queue.
+                    while (
+                        self._running
+                        and self._incoming_next_seq not in self._incoming_packets
+                        and self._incoming_end_seq is None
+                        and not any(
+                            seq > self._incoming_next_seq for seq in self._incoming_packets
+                        )
+                    ):
+                        await asyncio.sleep(0.01)
+                        next_deadline = loop.time()
                     wait_until = loop.time() + missing_grace
                     while (
                         self._running
@@ -570,6 +620,23 @@ class Application:
                 if payload is not None:
                     pcm = self._decoder.decode(payload) if self._decoder else payload
                     decoded_frames += 1
+                elif (
+                    self._decoder
+                    and hasattr(self._decoder, "decode_fec")
+                    and self._incoming_next_seq + 1 in self._incoming_packets
+                ):
+                    try:
+                        # Opus carries recovery data for frame N in frame N+1.
+                        # Do not consume N+1 here; it is decoded normally on
+                        # the following playout tick.
+                        pcm = self._decoder.decode_fec(
+                            self._incoming_packets[self._incoming_next_seq + 1]
+                        )
+                        concealed_frames += 1
+                    except Exception as exc:
+                        log.warning("decoder FEC failed at seq=%s: %s", self._incoming_next_seq, exc)
+                        pcm = self._decoder.conceal() if hasattr(self._decoder, "conceal") else b""
+                        concealed_frames += 1
                 elif self._decoder and hasattr(self._decoder, "conceal"):
                     try:
                         pcm = self._decoder.conceal()
@@ -601,7 +668,7 @@ class Application:
             )
             if self._playout_task is asyncio.current_task():
                 self._playout_task = None
-            await self.player.stop()
+            await self.player.stop(drain=True)
             self.stream_tracker.clear()
             self._reset_incoming_buffer()
             if self._running and self._state == self.RECEIVING:
@@ -612,12 +679,19 @@ async def run():
     app = Application()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    shutdown_started = False
 
     async def shutdown():
-        if stop_event.is_set():
+        nonlocal shutdown_started
+        if shutdown_started:
             return
-        stop_event.set()
-        await app.stop()
+        shutdown_started = True
+        try:
+            await app.stop()
+        finally:
+            # Do not let run() return and asyncio cancel this cleanup task
+            # before transports have restored their external state.
+            stop_event.set()
 
     app.set_shutdown_callback(shutdown)
 

@@ -155,12 +155,12 @@ class AudioPlayer:
         await self._ensure_started(prefill_frames)
         await self._queue.put(data)
 
-    async def stop(self):
+    async def stop(self, drain: bool = False):
         async with self._start_lock:
             # Stop the child first. A blocked pipe write in the executor cannot
             # consume the queue sentinel until aplay exits and closes the pipe.
             process = self._process
-            if process and process.poll() is None:
+            if not drain and process and process.poll() is None:
                 try:
                     process.terminate()
                 except Exception:
@@ -186,8 +186,14 @@ class AudioPlayer:
                 self._stderr_task = None
             if process:
                 try:
-                    process.wait(timeout=1)
+                    process.wait(timeout=2 if drain else 1)
                 except Exception:
+                    try:
+                        process.terminate()
+                        process.wait(timeout=1)
+                    except Exception:
+                        pass
+                if process.poll() is None:
                     try:
                         process.kill()
                         process.wait(timeout=1)

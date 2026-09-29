@@ -9,7 +9,7 @@
 核心功能：
 - 以 `whisplay-daemon` app 的形式接入和启动
 - 同时通过 Tailscale `MagicDNS` 和 ESP-NOW 心跳发现在线设备
-- 按住按钮讲话时，将麦克风音频压缩后通过所有可用的 TCP / ESP-NOW 路径发给在线 peer
+- 按住按钮讲话时，将麦克风音频压缩后通过可用的 TCP 路径发送，并始终通过 ESP-NOW 广播（不要求先发现 peer）
 - 其他设备实时播放，高亮当前说话设备，并在状态框显示接收图标
 - 空闲时屏幕显示设备列表、在线状态、心跳延时，以及明确的 `[ESP]` 或 `[TCP]` 传输标签
 
@@ -26,7 +26,7 @@
 - Header：
   显示 `WhisplayTalk` 标题，以及 VPN、Wi-Fi 信号、电池状态图标
 - 状态框：
-  显示当前 app 状态、本机设备名、实时 `ESP CH n` 射频信道，以及接收音频时右侧的说话图标
+  ESP bridge 可用时始终显示实时 `ESP CH n` 射频信道；切台期间显示 `Switching to CH n...`
 - 设备列表：
   即使在讲话或接收时也持续显示 peer 列表，包含在线/离线标记、传输标签和心跳延时，例如 `kitchen [TCP] (42ms)`
 - 当前讲话高亮：
@@ -91,7 +91,7 @@ ESP-NOW 是可选功能。普通的 `bash install.sh` 不会替换 Wi-Fi 固件�
 ```bash
 sudo bash tools/upgrade_espnow_firmware.sh
 sudo reboot
-sudo bash tools/install_espnow_bridge.sh
+bash tools/install_espnow_bridge.sh
 ```
 
 升级脚本会先校验仓库内的固件与驱动文件，并精确匹配当前运行内核。如果已有对应的
@@ -107,8 +107,24 @@ Radiotap/802.11 抓包和注入。
 固件升级并重启后，再安装可选的特权 radio bridge：
 
 ```bash
-sudo bash tools/install_espnow_bridge.sh
+bash tools/install_espnow_bridge.sh
 ```
+
+特权 bridge 已使用 Rust 实现，源码位于
+[`rust/espnow-bridge`](rust/espnow-bridge)。安装脚本会优先使用已有 release
+二进制；没有时就在 64 位 Zero 2 W 上通过 Cargo 本机编译。也可以统一在 CM5
+构建一次，再把 aarch64 二进制用于多台设备：
+
+```bash
+bash tools/build_espnow_bridge_rust.sh /tmp/whisplay-espnow-bridge
+WHISPLAY_ESPNOW_BRIDGE_BINARY=/tmp/whisplay-espnow-bridge \
+  bash tools/install_espnow_bridge.sh
+```
+
+Rust 进程负责 AF_PACKET 接收、libpcap 注入、信道恢复、射频副本去重和链路统计。
+Python Talk 继续使用原有本地 Unix 数据报协议，因此可以滚动升级，应用层和空口包格式
+保持兼容。`network/espnow_bridge.py` 作为可读的回退/协议参考保留，但安装脚本不再
+安装它。
 
 使用自动生成的设备名或设置 `WHISPLAY_TALK_DEVICE_NAME`，然后从
 `whisplay-daemon` 启动 Talk。Talk 本身仍以普通用户运行，通过
@@ -119,17 +135,26 @@ sudo bash tools/install_espnow_bridge.sh
 TCP/Tailscale 与 ESP-NOW 会始终同时启动，不再需要选择传输方式。如果固定的本地
 bridge socket 不存在，Talk 会自动降级为只使用 TCP。设备列表会根据 peer 的实际
 可用路径显示 `[ESP]`、`[TCP]` 或 `[ESP/TCP]`。
-普通 Wi-Fi 已关联时，ESP-NOW 始终跟随 AP 信道，bridge 不会主动换台。Wi-Fi
-未关联时，所有新版本节点统一回落到信道 6；如果连续 12 秒没有发现 peer，bridge
-会以随机、低占空比方式扫描信道 1/6/11，并在每次换台后立即发送发现帧。发现对端
+默认 `AUTO` 模式下，普通 Wi-Fi 已关联时 ESP-NOW 会跟随 AP 信道。PiSugar 自定义
+按钮双击会按 `1 → 2 → … → 13 → 1` 强制切换频道并进入 `FIXED` 模式；长按恢复
+`AUTO`。LCD 会显示 `ESP CH n AUTO` 或 `ESP CH n FIXED`，调谐期间显示
+`Switching to CH n...`。ESP 广播发送和接收不依赖设备列表中是否已有在线节点。由于 `wlan0` 与 `mon0`
+共用一个射频，固定到非 AP 信道时普通 Wi-Fi 可能暂时断开，恢复 AUTO 后会先返回
+此前 AP 信道再继续跟随。PiSugar 单击返回桌面的行为保持不变。
+bridge 在运行期间
+抑制后台漫游扫描，避免共享 PHY 临时离开当前信道；现有 Wi-Fi 连接保持在线，bridge
+退出时会恢复正常扫描。Wi-Fi 未关联时，所有新版本节点统一回落到信道 6；如果连续
+12 秒没有发现 peer，bridge
+会按共享的三秒时间片同步扫描信道 1/6/11，并在每次换台后立即发送发现帧。发现对端
 后，两台新版本节点会一起回到信道 6。这样设备在没有 AP 的环境中启动也能自动
 汇合，同时不会干扰已经建立的普通 Wi-Fi 连接。
-离线期间 bridge 会启用 Nexmon 扫描抑制，防止 NetworkManager 后台扫频悄悄改变
-ESP-NOW 信道；音频空闲时每分钟短暂恢复一次 Wi-Fi 扫描，使已配置的 AP 仍可重连。
-为提高无线可靠性，bridge 会关闭 Wi-Fi 省电，使用带长前导码的 1 Mbps DSSS，
-每个音频帧发送四次、每个发现心跳发送七次，并以带抖动的间隔分散副本，避免一次
-短暂干扰同时破坏所有副本。bridge 还会定期重建 Nexmon 的 pcap 注入句柄，并每
-十秒记录一次平滑后的 peer RSSI，供走距测试使用。Zero 2 W 校准数据将 2.4GHz
+离线期间音频空闲时每分钟短暂恢复一次 Wi-Fi 扫描，使已配置的 AP 仍可重连。
+为提高无线可靠性，bridge 会关闭 Wi-Fi 省电，使用带长前导码的 1 Mbps DSSS，并以
+带抖动的间隔分散副本，避免一次短暂干扰同时破坏所有副本。发现心跳固定发送七份；
+音频会根据最近最弱 peer 的 RSSI 自适应发送两到五份，近距离减少空口拥塞，接收边缘
+则增加保护。接收端会在交给 Talk 前过滤短时间内的射频副本。bridge 还会就地恢复
+失效的 Nexmon 注入句柄，并每十秒记录 RSSI、重复帧比例、当前音频副本数和估算的
+音频序列缺失量，便于走距测试。Zero 2 W 校准数据将 2.4GHz
 功率限制在约 19.5 dBm，因此不会强行越过校准功率以免增加失真。默认 Opus 码率
 为 12 kbps，以缩短空口帧。
 
@@ -138,6 +163,10 @@ ESP-NOW 信道；音频空闲时每分钟短暂恢复一次 Wi-Fi 扫描，使�
 ```bash
 venv/bin/python tools/espnow_app_smoke.py
 ```
+
+如需在不播放音频的情况下量化链路，可在两台设备上同时运行
+`tools/espnow_link_test.py`。它会按正常音频的 40ms 节奏发送 100 个无害探测 payload，
+并分别报告两个方向收到的唯一帧数和丢失率。
 
 ### AtomS3R 语音客户端
 

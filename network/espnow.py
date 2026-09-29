@@ -16,26 +16,46 @@ BRIDGE_REGISTER = b"R"
 BRIDGE_TRANSMIT = b"T"
 BRIDGE_FRAME = b"F"
 BRIDGE_STATUS = b"S"
+BRIDGE_SET_CHANNEL = b"C"
+BRIDGE_AUTO_CHANNEL = b"A"
+CHANNEL_MODE_AUTO = "AUTO"
+CHANNEL_MODE_FIXED = "FIXED"
+CHANNEL_MODE_SWITCHING = "SWITCHING"
 MAX_ESPNOW_PAYLOAD = 250
 BRIDGE_SOCKET_PATH = "/run/whisplay-espnow/bridge.sock"
 BROADCAST_MAC = b"\xff" * 6
 
 
-def decode_channel_status(data: bytes) -> int | None:
-    if len(data) != 2 or data[:1] != BRIDGE_STATUS:
+def decode_channel_status(data: bytes) -> tuple[int, str] | None:
+    if len(data) not in (2, 3) or data[:1] != BRIDGE_STATUS:
         return None
     channel = data[1]
-    return channel if 1 <= channel <= 13 else None
+    if not 1 <= channel <= 13:
+        return None
+    if len(data) == 2:
+        return channel, CHANNEL_MODE_AUTO
+    if data[2:3] == b"A":
+        return channel, CHANNEL_MODE_AUTO
+    if data[2:3] == b"F":
+        return channel, CHANNEL_MODE_FIXED
+    if data[2:3] == b"S":
+        return channel, CHANNEL_MODE_SWITCHING
+    return None
 
 
 class EspNowAudioTransport:
-    def __init__(self, on_packet):
+    def __init__(self, on_packet, restore_auto_on_stop: bool = True):
         self.on_packet = on_packet
+        self._restore_auto_on_stop = restore_auto_on_stop
         self._socket: socket.socket | None = None
         self._client_path = ""
         self._receive_task: asyncio.Task | None = None
         self._control_handler = None
         self.current_channel: int | None = None
+        self.channel_mode: str | None = None
+        self._requested_forced_channel: int | None = None
+        self._reconnect_lock = asyncio.Lock()
+        self._stopping = False
 
     def set_control_handler(self, callback):
         self._control_handler = callback
@@ -43,24 +63,78 @@ class EspNowAudioTransport:
     async def start(self):
         if self._socket:
             return
-        loop = asyncio.get_running_loop()
-        client_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-        self._client_path = f"/tmp/whisplay-espnow-{client_id}.sock"
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.setblocking(False)
-        sock.bind(self._client_path)
-        try:
-            sock.connect(BRIDGE_SOCKET_PATH)
-        except Exception:
-            sock.close()
-            self._remove_client_socket()
-            raise
-        self._socket = sock
-        await loop.sock_sendall(sock, BRIDGE_REGISTER)
+        self._stopping = False
+        await self._replace_socket()
         self._receive_task = asyncio.create_task(self._receive_loop())
         log.info("ESP-NOW transport connected to %s", BRIDGE_SOCKET_PATH)
 
+    async def _replace_socket(self):
+        loop = asyncio.get_running_loop()
+        client_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        client_path = f"/tmp/whisplay-espnow-{client_id}.sock"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        sock.bind(client_path)
+        try:
+            sock.connect(BRIDGE_SOCKET_PATH)
+            await loop.sock_sendall(sock, BRIDGE_REGISTER)
+            if self._requested_forced_channel is not None:
+                await loop.sock_sendall(
+                    sock, BRIDGE_SET_CHANNEL + bytes((self._requested_forced_channel,))
+                )
+        except Exception:
+            sock.close()
+            try:
+                os.unlink(client_path)
+            except FileNotFoundError:
+                pass
+            raise
+
+        previous_socket = self._socket
+        previous_path = self._client_path
+        self._socket = sock
+        self._client_path = client_path
+        if previous_socket:
+            previous_socket.close()
+        if previous_path:
+            try:
+                os.unlink(previous_path)
+            except FileNotFoundError:
+                pass
+
+    async def _reconnect(self, failed_socket: socket.socket):
+        async with self._reconnect_lock:
+            if self._stopping or self._socket is not failed_socket:
+                return
+            delay = 0.1
+            while not self._stopping and self._socket is failed_socket:
+                try:
+                    await self._replace_socket()
+                    self.current_channel = None
+                    self.channel_mode = None
+                    log.info("ESP-NOW transport reconnected to %s", BRIDGE_SOCKET_PATH)
+                    return
+                except (ConnectionRefusedError, FileNotFoundError, OSError) as exc:
+                    log.warning("ESP-NOW bridge reconnect pending: %s", exc)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+
     async def stop(self):
+        self._stopping = True
+        if self._socket and self._restore_auto_on_stop:
+            try:
+                # Leaving Talk must not strand the shared wlan0/mon0 PHY on a
+                # channel that is different from the configured access point.
+                # This is deliberately unconditional: an exit can race with
+                # the FIXED status notification, and AUTO is idempotent.
+                await asyncio.get_running_loop().sock_sendall(
+                    self._socket, BRIDGE_AUTO_CHANNEL
+                )
+                self._requested_forced_channel = None
+                await asyncio.sleep(0.05)
+                log.info("restored ESP-NOW AUTO channel before transport shutdown")
+            except OSError as exc:
+                log.warning("could not restore ESP-NOW AUTO during shutdown: %s", exc)
         if self._receive_task:
             self._receive_task.cancel()
             try:
@@ -84,12 +158,24 @@ class EspNowAudioTransport:
     async def _receive_loop(self):
         loop = asyncio.get_running_loop()
         while True:
-            data = await loop.sock_recv(self._socket, 4096)
-            channel = decode_channel_status(data)
-            if channel is not None:
-                if channel != self.current_channel:
-                    log.info("ESP-NOW channel=%s", channel)
+            sock = self._socket
+            if not sock:
+                return
+            try:
+                data = await loop.sock_recv(sock, 4096)
+            except asyncio.CancelledError:
+                raise
+            except OSError as exc:
+                log.warning("ESP-NOW bridge receive failed: %s", exc)
+                await self._reconnect(sock)
+                continue
+            channel_status = decode_channel_status(data)
+            if channel_status is not None:
+                channel, mode = channel_status
+                if channel != self.current_channel or mode != self.channel_mode:
+                    log.info("ESP-NOW channel=%s mode=%s", channel, mode)
                 self.current_channel = channel
+                self.channel_mode = mode
                 continue
             if len(data) < 7 or data[:1] != BRIDGE_FRAME:
                 continue
@@ -106,17 +192,55 @@ class EspNowAudioTransport:
     async def send_control(self, payload: bytes):
         await self._send_payload(DISCOVERY_MAGIC + payload, BROADCAST_MAC)
 
+    async def force_channel(self, channel: int):
+        if not 1 <= channel <= 13:
+            raise ValueError(f"invalid 2.4 GHz channel: {channel}")
+        previous_channel = self.current_channel
+        previous_mode = self.channel_mode
+        self._requested_forced_channel = channel
+        self.current_channel = channel
+        self.channel_mode = CHANNEL_MODE_SWITCHING
+        try:
+            await self._send_bridge_command(BRIDGE_SET_CHANNEL + bytes((channel,)))
+        except Exception:
+            self.current_channel = previous_channel
+            self.channel_mode = previous_mode
+            raise
+
+    async def use_auto_channel(self):
+        self._requested_forced_channel = None
+        await self._send_bridge_command(BRIDGE_AUTO_CHANNEL)
+
+    async def _send_bridge_command(self, command: bytes):
+        sock = self._socket
+        if not sock:
+            raise RuntimeError("ESP-NOW transport is not started")
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_sendall(sock, command)
+        except OSError:
+            await self._reconnect(sock)
+            if not self._socket:
+                raise RuntimeError("ESP-NOW bridge reconnect failed")
+            await loop.sock_sendall(self._socket, command)
+
     async def _send_payload(self, payload: bytes, destination: bytes):
-        if not self._socket:
+        sock = self._socket
+        if not sock:
             raise RuntimeError("ESP-NOW transport is not started")
         if len(payload) > MAX_ESPNOW_PAYLOAD:
             raise ValueError(f"ESP-NOW payload is {len(payload)} bytes; maximum is {MAX_ESPNOW_PAYLOAD}")
         if len(destination) != 6:
             raise ValueError("ESP-NOW destination must contain 6 octets")
-        await asyncio.get_running_loop().sock_sendall(
-            self._socket,
-            BRIDGE_TRANSMIT + destination + payload,
-        )
+        message = BRIDGE_TRANSMIT + destination + payload
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_sendall(sock, message)
+        except OSError:
+            await self._reconnect(sock)
+            if not self._socket:
+                raise RuntimeError("ESP-NOW bridge reconnect failed")
+            await loop.sock_sendall(self._socket, message)
 
     async def send_frame(
         self,
@@ -129,8 +253,6 @@ class EspNowAudioTransport:
         payload: bytes,
         redundant_payload: bytes = b"",
     ):
-        if not peers:
-            return
         packet = encode_packet(sender, stream_id, sequence, flags, codec, payload, redundant_payload)
         if len(packet) > MAX_ESPNOW_PAYLOAD and redundant_payload:
             packet = encode_packet(sender, stream_id, sequence, flags, codec, payload)

@@ -40,7 +40,7 @@ under `modules/<kernel-release>/`.
 ```sh
 sudo bash tools/upgrade_espnow_firmware.sh
 sudo reboot
-sudo bash tools/install_espnow_bridge.sh
+bash tools/install_espnow_bridge.sh
 ```
 
 Run the commands from the repository root. The normal project `install.sh` does

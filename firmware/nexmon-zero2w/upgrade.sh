@@ -71,4 +71,4 @@ NEXMON_MODULE_SOURCE="$module_source" "$artifact_dir/install.sh"
 
 echo "Upgrade complete. Reboot before using ESP-NOW."
 echo "After reboot, install the optional bridge with:"
-echo "  sudo bash $project_dir/tools/install_espnow_bridge.sh"
+echo "  bash $project_dir/tools/install_espnow_bridge.sh"
